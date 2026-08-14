@@ -175,8 +175,18 @@ export {
 	// Tool factories (for custom cwd)
 	createEditTool,
 	createIpythonTool,
+	createPolicyControlledSubagentRuntimeHost,
+	PolicyControlledSubagentRuntimeHost,
 	type PromptTemplate,
+	type RlmSubagentAdmissionDecision,
+	RlmSubagentAdmissionError,
+	type RlmSubagentAdmissionPolicy,
+	type RlmSubagentAdmissionRequest,
+	type RlmSubagentPolicyEntry,
+	type RlmSubagentPolicySnapshot,
+	type RlmSubagentPolicyStatus,
 	type RlmSubagentRuntime,
+	type RlmSubagentRuntimeOverrides,
 	type SubagentRuntimeHost,
 } from "./core/sdk.js";
 export type { SessionActionSnapshot } from "./core/session-action-store.js";

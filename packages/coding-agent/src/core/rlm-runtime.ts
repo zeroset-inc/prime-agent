@@ -240,3 +240,151 @@ export interface SubagentRuntimeHost {
 	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
 }
+
+export type RlmSubagentPolicyStatus = "creating" | "running" | "completed" | "error" | "cancelled" | "deleted";
+
+export interface RlmSubagentPolicyEntry {
+	id: string;
+	sessionName: string;
+	status: RlmSubagentPolicyStatus;
+}
+
+export interface RlmSubagentPolicySnapshot {
+	activeChildren: number;
+	totalChildren: number;
+	children: readonly RlmSubagentPolicyEntry[];
+}
+
+export type RlmSubagentRuntimeOverrides = Partial<
+	Pick<
+		CreateRlmSubagentRuntimeOptions,
+		| "model"
+		| "thinkingLevel"
+		| "serviceTier"
+		| "scopedModels"
+		| "activeToolNames"
+		| "allowedToolNames"
+		| "customTools"
+		| "includeGoals"
+		| "includeCompactSkill"
+		| "rlmMaxDepth"
+	>
+>;
+
+export interface RlmSubagentAdmissionRequest {
+	options: Readonly<CreateRlmSubagentRuntimeOptions>;
+	snapshot: RlmSubagentPolicySnapshot;
+}
+
+export type RlmSubagentAdmissionDecision =
+	| { allowed: true; overrides?: RlmSubagentRuntimeOverrides }
+	| { allowed: false; reason: string };
+
+export type RlmSubagentAdmissionPolicy = (
+	request: RlmSubagentAdmissionRequest,
+) => RlmSubagentAdmissionDecision | Promise<RlmSubagentAdmissionDecision>;
+
+export class RlmSubagentAdmissionError extends Error {
+	constructor(readonly reason: string) {
+		super(`RLM subagent admission denied: ${reason}`);
+		this.name = "RlmSubagentAdmissionError";
+	}
+}
+
+/**
+ * Decorate a runtime host with an embedding-owned, workflow-agnostic admission
+ * policy. Admission and reservation are serialized so concurrent spawns see a
+ * consistent active-child count. The delegate retains ownership of runtimes.
+ */
+export class PolicyControlledSubagentRuntimeHost implements SubagentRuntimeHost {
+	private readonly children = new Map<string, RlmSubagentPolicyEntry>();
+	private admissionTail = Promise.resolve();
+
+	constructor(
+		private readonly delegate: SubagentRuntimeHost,
+		private readonly policy: RlmSubagentAdmissionPolicy,
+	) {}
+
+	getSnapshot(): RlmSubagentPolicySnapshot {
+		const children = [...this.children.values()].map((entry) => ({ ...entry }));
+		return {
+			activeChildren: children.filter((entry) => entry.status === "creating" || entry.status === "running").length,
+			totalChildren: children.length,
+			children,
+		};
+	}
+
+	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
+		const admittedOptions = await this.reserve(options);
+		try {
+			const runtime = await this.delegate.createRlmSubagentRuntime(admittedOptions);
+			this.update(admittedOptions.id, { status: "running" });
+			return runtime;
+		} catch (error) {
+			this.update(admittedOptions.id, { status: "error" });
+			throw error;
+		}
+	}
+
+	completeRlmSubagentRuntime(childId: string, session: AgentSession): boolean {
+		const completed = this.delegate.completeRlmSubagentRuntime?.(childId, session);
+		if (completed !== false) this.update(childId, { status: "completed" });
+		return completed ?? true;
+	}
+
+	async releaseRlmSubagentRuntime(
+		runtime: RlmSubagentRuntime,
+		options: CreateRlmSubagentRuntimeOptions,
+		status: "done" | "error" | "cancelled",
+	): Promise<void> {
+		await this.delegate.releaseRlmSubagentRuntime?.(runtime, options, status);
+		this.update(options.id, { status: status === "done" ? "completed" : status });
+	}
+
+	async deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void> {
+		await this.delegate.deleteRlmSubagentRuntime(childId, session);
+		this.update(childId, { status: "deleted" });
+	}
+
+	async disposeRlmSubagentRuntimes(): Promise<void> {
+		await this.delegate.disposeRlmSubagentRuntimes?.();
+		for (const childId of this.children.keys()) this.update(childId, { status: "deleted" });
+	}
+
+	private async reserve(options: CreateRlmSubagentRuntimeOptions): Promise<CreateRlmSubagentRuntimeOptions> {
+		let releaseAdmission: (() => void) | undefined;
+		const previousAdmission = this.admissionTail;
+		this.admissionTail = new Promise<void>((resolve) => {
+			releaseAdmission = resolve;
+		});
+		await previousAdmission;
+		try {
+			if (this.children.has(options.id)) {
+				throw new RlmSubagentAdmissionError(`child id is already registered: ${options.id}`);
+			}
+			const decision = await this.policy({ options, snapshot: this.getSnapshot() });
+			if (!decision.allowed) throw new RlmSubagentAdmissionError(decision.reason);
+			const admittedOptions = { ...options, ...decision.overrides };
+			this.children.set(options.id, {
+				id: options.id,
+				sessionName: options.sessionName,
+				status: "creating",
+			});
+			return admittedOptions;
+		} finally {
+			releaseAdmission?.();
+		}
+	}
+
+	private update(childId: string, update: Partial<RlmSubagentPolicyEntry>): void {
+		const current = this.children.get(childId);
+		if (current) this.children.set(childId, { ...current, ...update });
+	}
+}
+
+export function createPolicyControlledSubagentRuntimeHost(
+	delegate: SubagentRuntimeHost,
+	policy: RlmSubagentAdmissionPolicy,
+): PolicyControlledSubagentRuntimeHost {
+	return new PolicyControlledSubagentRuntimeHost(delegate, policy);
+}
