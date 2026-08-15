@@ -24,6 +24,10 @@ export interface RlmDelegateRequest extends RlmRunRequest {
 	task: AgentTaskDelegationInput;
 }
 
+export interface RlmReplaceRequest extends RlmRunRequest {
+	taskId: string;
+}
+
 export type RlmSubagentRegistryStatus = "running" | "completed" | "error";
 
 export interface RlmSubagentRegistryEntry {
@@ -58,6 +62,7 @@ export interface RlmFindModelsResult {
 
 export type RlmRunHandler = (request: RlmRunRequest) => Promise<Record<string, unknown>>;
 export type RlmDelegateHandler = (request: RlmDelegateRequest) => Promise<Record<string, unknown>>;
+export type RlmReplaceHandler = (request: RlmReplaceRequest) => Promise<Record<string, unknown>>;
 export type RlmListSubagentsHandler = () => RlmListSubagentsResult | Promise<RlmListSubagentsResult>;
 export type RlmDeleteSubagentHandler = (target: string) => Promise<RlmDeleteSubagentResult>;
 export type RlmFindModelsHandler = (query: string, limit: number) => RlmFindModelsResult | Promise<RlmFindModelsResult>;
@@ -193,6 +198,24 @@ export function createRlmDelegateHostHandler(handler: RlmDelegateHandler): HostR
 	};
 }
 
+/** Adapt an RlmReplaceHandler into the atomic "rlm.replace" host handler. */
+export function createRlmReplaceHostHandler(handler: RlmReplaceHandler): HostRequestHandler {
+	return async (payload) => {
+		if (typeof payload.prompt !== "string") throw new Error("rlm.replace prompt must be a string");
+		if (typeof payload.task_id !== "string" || !payload.task_id.trim()) {
+			throw new Error("rlm.replace task_id must be a non-empty string");
+		}
+		const kwargs = isRecord(payload.kwargs) ? payload.kwargs : {};
+		const cellSourceCode = typeof payload.cellSourceCode === "string" ? payload.cellSourceCode : undefined;
+		return handler({
+			prompt: payload.prompt,
+			taskId: payload.task_id.trim(),
+			kwargs,
+			cellSourceCode,
+		});
+	};
+}
+
 /** Search a bounded authenticated model catalog without adding it to the system prompt. */
 export function createRlmFindModelsHostHandler(handler: RlmFindModelsHandler): HostRequestHandler {
 	return async (payload) => {
@@ -250,6 +273,10 @@ export interface CreateRlmSubagentRuntimeOptions {
 	rlmParentNodeId: string;
 	/** Durable task owned by this child when it was spawned through rlm.delegate. */
 	taskId?: string;
+	/** Immutable actor identity used to authorize this child's task operations. */
+	taskActorId?: string;
+	/** Shared execution capacity acquired for each child turn, including retained follow-ups. */
+	turnCapacityPool?: RlmSubagentCapacityPool;
 	/** Cancels runtime admission or startup before the child session is published. */
 	signal?: AbortSignal;
 	/** Source of the IPython cell that spawned this subagent, for display. */
@@ -455,10 +482,12 @@ export class PolicyControlledSubagentRuntimeHost implements SubagentRuntimeHost 
 			...(options.taskId ? { taskId: options.taskId } : {}),
 		});
 		try {
-			await this.acquireCapacity(options.id, options.signal);
 			const admittedOptions = await this.reserve(options);
 			options.signal?.throwIfAborted();
-			const runtime = await this.delegate.createRlmSubagentRuntime(admittedOptions);
+			const runtime = await this.delegate.createRlmSubagentRuntime({
+				...admittedOptions,
+				...(this.capacityPool ? { turnCapacityPool: this.capacityPool } : {}),
+			});
 			this.update(admittedOptions.id, { status: "running" });
 			return runtime;
 		} catch (error) {
@@ -467,7 +496,6 @@ export class PolicyControlledSubagentRuntimeHost implements SubagentRuntimeHost 
 			} else {
 				this.update(options.id, { status: options.signal?.aborted ? "cancelled" : "error" });
 			}
-			this.releaseCapacity(options.id);
 			throw error;
 		}
 	}
@@ -476,7 +504,6 @@ export class PolicyControlledSubagentRuntimeHost implements SubagentRuntimeHost 
 		const completed = this.delegate.completeRlmSubagentRuntime?.(childId, session);
 		if (completed !== false) {
 			this.update(childId, { status: "completed" });
-			this.releaseCapacity(childId);
 		}
 		return completed ?? true;
 	}
@@ -486,26 +513,17 @@ export class PolicyControlledSubagentRuntimeHost implements SubagentRuntimeHost 
 		options: CreateRlmSubagentRuntimeOptions,
 		status: "done" | "error" | "cancelled",
 	): Promise<void> {
-		try {
-			await this.delegate.releaseRlmSubagentRuntime?.(runtime, options, status);
-			this.update(options.id, { status: status === "done" ? "completed" : status });
-		} finally {
-			this.releaseCapacity(options.id);
-		}
+		await this.delegate.releaseRlmSubagentRuntime?.(runtime, options, status);
+		this.update(options.id, { status: status === "done" ? "completed" : status });
 	}
 
 	async deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void> {
-		try {
-			await this.delegate.deleteRlmSubagentRuntime(childId, session);
-			this.update(childId, { status: "deleted" });
-		} finally {
-			this.releaseCapacity(childId);
-		}
+		await this.delegate.deleteRlmSubagentRuntime(childId, session);
+		this.update(childId, { status: "deleted" });
 	}
 
 	async disposeRlmSubagentRuntimes(): Promise<void> {
 		this.disposed = true;
-		for (const childId of this.children.keys()) this.releaseCapacity(childId);
 		try {
 			await this.delegate.disposeRlmSubagentRuntimes?.();
 		} finally {
@@ -535,14 +553,6 @@ export class PolicyControlledSubagentRuntimeHost implements SubagentRuntimeHost 
 	private update(childId: string, update: Partial<RlmSubagentPolicyEntry>): void {
 		const current = this.children.get(childId);
 		if (current) this.children.set(childId, { ...current, ...update });
-	}
-
-	private acquireCapacity(childId: string, signal?: AbortSignal): Promise<void> {
-		return this.capacityPool?.acquire(childId, signal) ?? Promise.resolve();
-	}
-
-	private releaseCapacity(childId: string): void {
-		this.capacityPool?.release(childId);
 	}
 }
 

@@ -766,6 +766,55 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("atomically replaces a task runtime and revokes the previous session actor", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "replacement-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "replacement-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: { requireExclusiveClaims: true },
+		});
+		let firstTurnStarted = false;
+		const root = createSession({
+			sessionManager,
+			maxDepth: 2,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+			streamFn: (_model, context) => {
+				if (userText(context).includes("first runtime")) {
+					firstTurnStarted = true;
+					return createAssistantMessageEventStream();
+				}
+				return streamAnswer("replacement complete");
+			},
+		});
+
+		const original = await root.delegateRlmChild("first runtime", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			delegationReason: "Independent runtime boundary",
+		});
+		await waitFor(() => firstTurnStarted);
+		const originalSession = root.getRlmChildSession(original.rlm_child_id);
+		if (!originalSession || !original.task_id) throw new Error("Missing original coordinated child");
+		const originalHandlers = (originalSession as unknown as InspectableRlmSession)._createKernelHostHandlers();
+
+		const replacement = await root.replaceRlmTask(original.task_id, "replacement runtime");
+		expect(replacement.task_id).toBe(original.task_id);
+		expect(graph.getTask(original.task_id).ownerAgentId).toBe(replacement.rlm_child_id);
+		await expect(originalHandlers["rlm.task.update"]?.({ summary: "stale actor still working" })).rejects.toThrow(
+			"does not own task",
+		);
+		await waitFor(() => graph.getTask(original.task_id!).status === "completed");
+	});
+
 	it("marks an in-cell roled send to the parent as replied", async () => {
 		const sendAgentMessage = vi.fn(async () => ({
 			id: "agentmsg-reply",

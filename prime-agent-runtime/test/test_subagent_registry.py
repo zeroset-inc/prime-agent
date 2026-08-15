@@ -132,6 +132,36 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         )
         self.assertEqual(result.task_id, "task-runtime")
 
+    def test_replaces_a_task_owner_atomically(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "rlm_child_id": "sub-replacement",
+                "name": "replacement",
+                "session_dir": "/tmp/parent/sub-replacement",
+                "model": "zero/balanced",
+                "task_id": "task-runtime",
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            result = asyncio.run(
+                rlm_module.rlm.replace(
+                    "task-runtime",
+                    "Continue from the durable task state",
+                    name="replacement",
+                )
+            )
+
+        host_request.assert_awaited_once_with(
+            "rlm.replace",
+            {
+                "task_id": "task-runtime",
+                "prompt": "Continue from the durable task state",
+                "kwargs": {"name": "replacement"},
+            },
+        )
+        self.assertEqual(result.task_id, "task-runtime")
+
     def test_exposes_task_progress_and_tree_operations(self) -> None:
         host_request = AsyncMock(side_effect=[{"task": {"id": "task-a"}}, {"snapshot": {"totalTasks": 1}}, {"task": {"id": "task-a"}}])
 
@@ -160,6 +190,15 @@ class RlmSubagentRegistryTest(unittest.TestCase):
                 },
             ),
         )
+
+    def test_fetches_full_root_context_on_demand(self) -> None:
+        host_request = AsyncMock(return_value={"rootContext": {"manifest": ["a.ts"]}})
+
+        with patch.object(rlm_module, "host_request", host_request):
+            context = asyncio.run(rlm_module.rlm.task.root_context())
+
+        self.assertEqual(context, {"manifest": ["a.ts"]})
+        host_request.assert_awaited_once_with("rlm.task.root_context")
 
     def test_finds_authenticated_models_through_host(self) -> None:
         host_request = AsyncMock(

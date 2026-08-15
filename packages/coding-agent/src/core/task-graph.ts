@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -8,6 +8,8 @@ export const AGENT_TASK_LIST_MAX_ITEMS = 256;
 export const AGENT_TASK_CLAIM_MAX_ITEMS = 5_000;
 export const AGENT_TASK_RESULT_MAX_BYTES = 64 * 1024;
 export const AGENT_TASK_SNAPSHOT_PAGE_MAX_ITEMS = 100;
+export const AGENT_TASK_SNAPSHOT_COMPACT_EVENT_THRESHOLD = 128;
+export const AGENT_TASK_SNAPSHOT_COMPACT_BYTE_THRESHOLD = 512 * 1024;
 
 export type AgentTaskStatus =
 	| "pending"
@@ -29,6 +31,7 @@ export interface AgentTaskResourceClaim {
 export interface AgentTaskContextEnvelope {
 	rootObjective: string;
 	rootContext?: Record<string, unknown>;
+	rootContextDescriptor?: AgentTaskRootContextDescriptor;
 	taskId: string;
 	parentTaskId?: string;
 	lineage: string[];
@@ -45,6 +48,16 @@ export interface AgentTaskContextEnvelope {
 	verificationExpectations: string[];
 	resultSchema?: Record<string, unknown>;
 	version: number;
+}
+
+export interface AgentTaskRootContextDescriptor {
+	sha256: string;
+	byteLength: number;
+}
+
+export interface AgentTaskGraphHealth {
+	status: "healthy" | "degraded" | "failed";
+	error?: string;
 }
 
 export interface AgentTaskProgress {
@@ -121,6 +134,7 @@ export interface AgentTaskGraphSnapshot {
 	rootTaskId: string;
 	rootAgentId: string;
 	rootContext?: Record<string, unknown>;
+	inheritedContext?: Record<string, unknown>;
 	version: number;
 	tasks: AgentTask[];
 }
@@ -159,6 +173,8 @@ export interface AgentTaskRootInput {
 	verificationExpectations?: string[];
 	resultSchema?: Record<string, unknown>;
 	rootContext?: Record<string, unknown>;
+	/** Bounded root-context projection inherited by every descendant prompt. */
+	inheritedContext?: Record<string, unknown>;
 }
 
 export interface AgentTaskDelegationInput {
@@ -209,6 +225,8 @@ interface AgentTaskGraphEvent {
 	actorAgentId: string;
 	taskIds: string[];
 	tasks: AgentTask[];
+	rootAgentId?: string;
+	usageDelta?: { taskId: string; usage: AgentTaskUsage; taskVersion: number; updatedAt: string };
 	at: string;
 }
 
@@ -226,6 +244,10 @@ export class AgentTaskGraph {
 	private readonly eventsPath: string;
 	private readonly policy: AgentTaskGraphPolicy;
 	private state: AgentTaskGraphSnapshot;
+	private eventsSinceSnapshot = 0;
+	private bytesSinceSnapshot = 0;
+	private degradedError?: Error;
+	private fatalError?: Error;
 
 	private constructor(options: OpenAgentTaskGraphOptions) {
 		this.policy = options.policy ?? {};
@@ -252,13 +274,24 @@ export class AgentTaskGraph {
 		return this.state.version;
 	}
 
+	getHealth(): AgentTaskGraphHealth {
+		if (this.fatalError) return { status: "failed", error: this.fatalError.message };
+		if (this.degradedError) return { status: "degraded", error: this.degradedError.message };
+		return { status: "healthy" };
+	}
+
+	/** Persist a compact recovery point and rotate journal entries already represented by it. */
+	checkpoint(): void {
+		this.assertWritable();
+		this.compactSnapshot(true);
+	}
+
 	rebindRootAgent(ownerAgentId: string): AgentTask {
 		const normalizedOwner = normalizeIdentifier(ownerAgentId, "ownerAgentId");
 		const root = this.findTask(this.state.rootTaskId);
 		if (this.state.rootAgentId === normalizedOwner && root.ownerAgentId === normalizedOwner) return clone(root);
-		this.state = { ...this.state, rootAgentId: normalizedOwner };
 		const next = touchTask({ ...root, ownerAgentId: normalizedOwner });
-		this.commit("graph.root_rebound", normalizedOwner, [next]);
+		this.commit("graph.root_rebound", normalizedOwner, [next], { rootAgentId: normalizedOwner });
 		return clone(next);
 	}
 
@@ -364,7 +397,12 @@ export class AgentTaskGraph {
 		const root = this.findTask(this.state.rootTaskId);
 		return {
 			rootObjective: root.objective,
-			...(this.state.rootContext ? { rootContext: clone(this.state.rootContext) } : {}),
+			...(this.state.inheritedContext
+				? { rootContext: clone(this.state.inheritedContext) }
+				: this.state.rootContext
+					? { rootContext: clone(this.state.rootContext) }
+					: {}),
+			...(this.state.rootContext ? { rootContextDescriptor: rootContextDescriptor(this.state.rootContext) } : {}),
 			taskId: task.id,
 			...(task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}),
 			lineage: this.lineage(task.id),
@@ -384,6 +422,10 @@ export class AgentTaskGraph {
 		};
 	}
 
+	getRootContext(): Record<string, unknown> | undefined {
+		return this.state.rootContext ? clone(this.state.rootContext) : undefined;
+	}
+
 	reserveDelegation(input: {
 		parentTaskId: string;
 		callerAgentId: string;
@@ -400,9 +442,6 @@ export class AgentTaskGraph {
 		const exclusiveClaims = normalized.exclusiveClaims ?? [];
 		if (this.policy.requireExclusiveClaims && exclusiveClaims.length === 0) {
 			throw new AgentTaskGraphError("delegated task must transfer at least one exclusive claim");
-		}
-		if (exclusiveClaims.length === 0 && normalized.questions.length === 0) {
-			throw new AgentTaskGraphError("delegated task must transfer a claim or own a specific question");
 		}
 		for (const claim of exclusiveClaims) {
 			if (!parent.exclusiveClaims.some((candidate) => sameClaim(candidate, claim))) {
@@ -608,7 +647,7 @@ export class AgentTaskGraph {
 		const task = this.findTask(taskId);
 		if (task.status === "completed") return clone(task);
 		return this.completeTask(taskId, callerAgentId, {
-			summary: normalizeText(summary || "Task completed without a textual result.", "result.summary"),
+			summary: boundedRuntimeText(summary, "Task completed without a textual result."),
 			verification: [],
 			candidateFindings: [],
 			unresolvedQuestions: [],
@@ -632,7 +671,7 @@ export class AgentTaskGraph {
 		if (task.status === "completed" || task.status === "cancelled" || task.status === "interrupted")
 			return clone(task);
 		if (callerAgentId !== task.ownerAgentId) this.assertCanSupervise(task, callerAgentId);
-		const changed = this.cancelSubtree(task, "interrupted", callerAgentId, reason);
+		const changed = this.cancelSubtree(task, "interrupted", reason);
 		this.commit("task.interrupted", callerAgentId, changed);
 		return this.getTask(taskId);
 	}
@@ -640,7 +679,7 @@ export class AgentTaskGraph {
 	cancelTask(taskId: string, callerAgentId: string, reason: string): AgentTask {
 		const task = this.findTask(taskId);
 		this.assertCanSupervise(task, callerAgentId);
-		const changed = this.cancelSubtree(task, "cancelled", callerAgentId, reason);
+		const changed = this.cancelSubtree(task, "cancelled", reason);
 		this.commit("task.cancelled", callerAgentId, changed);
 		return this.getTask(taskId);
 	}
@@ -660,17 +699,24 @@ export class AgentTaskGraph {
 
 	recordUsage(taskId: string, usage: Partial<AgentTaskUsage>, actorAgentId: string): AgentTask {
 		const task = this.findTask(taskId);
+		const delta: AgentTaskUsage = {
+			input: normalizeUsageNumber(usage.input),
+			output: normalizeUsageNumber(usage.output),
+			cacheRead: normalizeUsageNumber(usage.cacheRead),
+			cacheWrite: normalizeUsageNumber(usage.cacheWrite),
+			cost: normalizeUsageNumber(usage.cost),
+		};
 		const next = touchTask({
 			...task,
 			usage: {
-				input: task.usage.input + normalizeUsageNumber(usage.input),
-				output: task.usage.output + normalizeUsageNumber(usage.output),
-				cacheRead: task.usage.cacheRead + normalizeUsageNumber(usage.cacheRead),
-				cacheWrite: task.usage.cacheWrite + normalizeUsageNumber(usage.cacheWrite),
-				cost: task.usage.cost + normalizeUsageNumber(usage.cost),
+				input: task.usage.input + delta.input,
+				output: task.usage.output + delta.output,
+				cacheRead: task.usage.cacheRead + delta.cacheRead,
+				cacheWrite: task.usage.cacheWrite + delta.cacheWrite,
+				cost: task.usage.cost + delta.cost,
 			},
 		});
-		this.commit("task.usage", actorAgentId, [next]);
+		this.commitUsage(actorAgentId, next, delta);
 		return clone(next);
 	}
 
@@ -730,6 +776,7 @@ export class AgentTaskGraph {
 			rootTaskId: task.id,
 			rootAgentId: root.ownerAgentId,
 			...(root.rootContext ? { rootContext: clone(root.rootContext) } : {}),
+			...(root.inheritedContext ? { inheritedContext: clone(root.inheritedContext) } : {}),
 			version: 1,
 			tasks: [task],
 		};
@@ -738,31 +785,36 @@ export class AgentTaskGraph {
 	}
 
 	private recover(rootAgentId: string): void {
-		const changed: AgentTask[] = [];
-		const liveTaskIds = new Set(
+		const root = this.findTask(this.state.rootTaskId);
+		const rootAgentChanged = this.state.rootAgentId !== rootAgentId;
+		if (root.ownerAgentId !== rootAgentId || root.status !== "running" || rootAgentChanged) {
+			this.commit(
+				"graph.recovered",
+				rootAgentId,
+				root.ownerAgentId !== rootAgentId || root.status !== "running"
+					? [touchTask({ ...root, ownerAgentId: rootAgentId, status: "running" })]
+					: [],
+				rootAgentChanged ? { rootAgentId } : undefined,
+			);
+		}
+		const activeTaskIds = new Set(
 			this.state.tasks
-				.filter(
-					(task) => task.id !== this.state.rootTaskId && (task.status === "starting" || task.status === "running"),
-				)
+				.filter((task) => task.id !== this.state.rootTaskId && ACTIVE_TASK_STATUSES.has(task.status))
 				.map((task) => task.id),
 		);
-		for (const task of this.state.tasks) {
-			if (task.id === this.state.rootTaskId) {
-				if (task.ownerAgentId !== rootAgentId || task.status !== "running") {
-					changed.push(touchTask({ ...task, ownerAgentId: rootAgentId, status: "running" }));
-				}
-				continue;
-			}
-			if (task.status === "starting" || task.status === "running") {
-				if (task.parentTaskId && liveTaskIds.has(task.parentTaskId)) continue;
-				changed.push(
-					...this.cancelSubtree(task, "interrupted", rootAgentId, "Runtime restarted before task completion"),
-				);
-			}
-		}
-		if (this.state.rootAgentId !== rootAgentId) this.state = { ...this.state, rootAgentId };
-		if (changed.length > 0 || this.state.rootAgentId !== rootAgentId) {
-			this.commit("graph.recovered", rootAgentId, deduplicateTasks(changed));
+		const recoveryRoots = this.state.tasks.filter(
+			(task) => activeTaskIds.has(task.id) && (!task.parentTaskId || !activeTaskIds.has(task.parentTaskId)),
+		);
+		// Commit each recovery root independently so sibling claim reclamation composes
+		// against the state produced by the previous interruption.
+		for (const task of recoveryRoots) {
+			const current = this.findTask(task.id);
+			if (!ACTIVE_TASK_STATUSES.has(current.status)) continue;
+			this.commit(
+				"task.recovered_as_interrupted",
+				rootAgentId,
+				this.cancelSubtree(current, "interrupted", "Runtime restarted before task completion"),
+			);
 		}
 	}
 
@@ -783,7 +835,22 @@ export class AgentTaskGraph {
 			if (event.graphId !== state.graphId || event.graphVersion <= state.version) continue;
 			const tasks = new Map(state.tasks.map((task) => [task.id, task]));
 			for (const task of event.tasks) tasks.set(task.id, task);
-			state = { ...state, version: event.graphVersion, tasks: [...tasks.values()] };
+			if (event.usageDelta) {
+				const task = tasks.get(event.usageDelta.taskId);
+				if (!task) throw new AgentTaskGraphError(`usage event references unknown task: ${event.usageDelta.taskId}`);
+				tasks.set(
+					task.id,
+					addUsageDelta(task, event.usageDelta.usage, event.usageDelta.updatedAt, event.usageDelta.taskVersion),
+				);
+			}
+			state = {
+				...state,
+				version: event.graphVersion,
+				...(event.rootAgentId ? { rootAgentId: event.rootAgentId } : {}),
+				tasks: [...tasks.values()],
+			};
+			this.eventsSinceSnapshot += 1;
+			this.bytesSinceSnapshot += Buffer.byteLength(line, "utf8") + 1;
 		}
 		return state;
 	}
@@ -803,12 +870,23 @@ export class AgentTaskGraph {
 		this.writeSnapshot(state);
 	}
 
-	private commit(type: string, actorAgentId: string, changedTasks: AgentTask[]): void {
-		if (changedTasks.length === 0) return;
+	private commit(
+		type: string,
+		actorAgentId: string,
+		changedTasks: AgentTask[],
+		graphPatch?: { rootAgentId?: string },
+	): void {
+		if (changedTasks.length === 0 && !graphPatch?.rootAgentId) return;
+		this.assertWritable();
 		const version = this.state.version + 1;
 		const tasks = new Map(this.state.tasks.map((task) => [task.id, task]));
 		for (const task of changedTasks) tasks.set(task.id, task);
-		const next: AgentTaskGraphSnapshot = { ...this.state, version, tasks: [...tasks.values()] };
+		const next: AgentTaskGraphSnapshot = {
+			...this.state,
+			version,
+			...(graphPatch?.rootAgentId ? { rootAgentId: graphPatch.rootAgentId } : {}),
+			tasks: [...tasks.values()],
+		};
 		const event: AgentTaskGraphEvent = {
 			schemaVersion: AGENT_TASK_GRAPH_SCHEMA_VERSION,
 			graphId: next.graphId,
@@ -817,11 +895,71 @@ export class AgentTaskGraph {
 			actorAgentId,
 			taskIds: changedTasks.map((task) => task.id),
 			tasks: clone(changedTasks),
+			...(graphPatch?.rootAgentId ? { rootAgentId: graphPatch.rootAgentId } : {}),
 			at: new Date().toISOString(),
 		};
-		appendFileSync(this.eventsPath, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
-		this.writeSnapshot(next);
+		this.appendEvent(event);
 		this.state = next;
+		this.compactSnapshot(false);
+	}
+
+	private commitUsage(actorAgentId: string, nextTask: AgentTask, usage: AgentTaskUsage): void {
+		this.assertWritable();
+		const version = this.state.version + 1;
+		const tasks = new Map(this.state.tasks.map((task) => [task.id, task]));
+		tasks.set(nextTask.id, nextTask);
+		const next = { ...this.state, version, tasks: [...tasks.values()] };
+		this.appendEvent({
+			schemaVersion: AGENT_TASK_GRAPH_SCHEMA_VERSION,
+			graphId: next.graphId,
+			graphVersion: version,
+			type: "task.usage",
+			actorAgentId,
+			taskIds: [nextTask.id],
+			tasks: [],
+			usageDelta: {
+				taskId: nextTask.id,
+				usage,
+				taskVersion: nextTask.version,
+				updatedAt: nextTask.updatedAt,
+			},
+			at: new Date().toISOString(),
+		});
+		this.state = next;
+		this.compactSnapshot(false);
+	}
+
+	private appendEvent(event: AgentTaskGraphEvent): void {
+		const encoded = `${JSON.stringify(event)}\n`;
+		try {
+			appendFileSync(this.eventsPath, encoded, { encoding: "utf8", mode: 0o600 });
+			this.eventsSinceSnapshot += 1;
+			this.bytesSinceSnapshot += Buffer.byteLength(encoded, "utf8");
+		} catch (error) {
+			this.fatalError = asError(error);
+			throw new AgentTaskGraphError(`task graph journal write failed: ${this.fatalError.message}`);
+		}
+	}
+
+	private compactSnapshot(required: boolean): void {
+		if (
+			!required &&
+			this.eventsSinceSnapshot < AGENT_TASK_SNAPSHOT_COMPACT_EVENT_THRESHOLD &&
+			this.bytesSinceSnapshot < AGENT_TASK_SNAPSHOT_COMPACT_BYTE_THRESHOLD
+		) {
+			return;
+		}
+		try {
+			this.writeSnapshot(this.state);
+			writeFileSync(this.eventsPath, "", { encoding: "utf8", mode: 0o600 });
+			chmodSync(this.eventsPath, 0o600);
+			this.eventsSinceSnapshot = 0;
+			this.bytesSinceSnapshot = 0;
+			this.degradedError = undefined;
+		} catch (error) {
+			this.degradedError = asError(error);
+			if (required) throw new AgentTaskGraphError(`task graph checkpoint failed: ${this.degradedError.message}`);
+		}
 	}
 
 	private writeSnapshot(snapshot: AgentTaskGraphSnapshot): void {
@@ -831,19 +969,14 @@ export class AgentTaskGraph {
 		chmodSync(this.snapshotPath, 0o600);
 	}
 
-	private cancelSubtree(
-		task: AgentTask,
-		status: "cancelled" | "interrupted",
-		actorAgentId: string,
-		reason: string,
-	): AgentTask[] {
+	private cancelSubtree(task: AgentTask, status: "cancelled" | "interrupted", reason: string): AgentTask[] {
 		const subtree = this.collectActiveSubtree(task);
 		const changed = subtree.map((candidate) =>
 			touchTask({
 				...candidate,
 				status,
 				result: {
-					summary: normalizeText(reason, "cancellation reason"),
+					summary: boundedRuntimeText(reason, "Task cancelled without a reason."),
 					verification: [],
 					candidateFindings: [],
 					unresolvedQuestions: [],
@@ -866,7 +999,6 @@ export class AgentTaskGraph {
 			});
 			changed.push(nextParent);
 		}
-		void actorAgentId;
 		return deduplicateTasks(changed);
 	}
 
@@ -921,6 +1053,10 @@ export class AgentTaskGraph {
 			throw new AgentTaskGraphError(`cannot ${operation} task ${task.id} with status ${task.status}`);
 		}
 	}
+
+	private assertWritable(): void {
+		if (this.fatalError) throw new AgentTaskGraphError(`task graph durability failed: ${this.fatalError.message}`);
+	}
 }
 
 export function formatAgentTaskContextEnvelope(envelope: AgentTaskContextEnvelope): string {
@@ -951,6 +1087,9 @@ function normalizeRootInput(input: AgentTaskRootInput): AgentTaskRootInput {
 		),
 		...(input.resultSchema ? { resultSchema: normalizeRecord(input.resultSchema, "root.resultSchema") } : {}),
 		...(input.rootContext ? { rootContext: normalizeRecord(input.rootContext, "root.rootContext") } : {}),
+		...(input.inheritedContext
+			? { inheritedContext: normalizeRecord(input.inheritedContext, "root.inheritedContext") }
+			: {}),
 	};
 }
 
@@ -1090,6 +1229,46 @@ function normalizeUsageNumber(value: number | undefined): number {
 
 function emptyUsage(): AgentTaskUsage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+}
+
+function addUsageDelta(
+	task: AgentTask,
+	delta: AgentTaskUsage,
+	updatedAt = new Date().toISOString(),
+	taskVersion = task.version + 1,
+): AgentTask {
+	return {
+		...task,
+		usage: {
+			input: task.usage.input + delta.input,
+			output: task.usage.output + delta.output,
+			cacheRead: task.usage.cacheRead + delta.cacheRead,
+			cacheWrite: task.usage.cacheWrite + delta.cacheWrite,
+			cost: task.usage.cost + delta.cost,
+		},
+		version: taskVersion,
+		updatedAt,
+	};
+}
+
+function boundedRuntimeText(value: string, fallback: string): string {
+	const normalized = typeof value === "string" ? value.trim() : "";
+	const source = normalized || fallback;
+	if (source.length <= AGENT_TASK_TEXT_MAX_LENGTH) return source;
+	const marker = "\n\n[truncated by task runtime]";
+	return `${source.slice(0, AGENT_TASK_TEXT_MAX_LENGTH - marker.length).trimEnd()}${marker}`;
+}
+
+function rootContextDescriptor(context: Record<string, unknown>): AgentTaskRootContextDescriptor {
+	const encoded = JSON.stringify(context);
+	return {
+		sha256: createHash("sha256").update(encoded).digest("hex"),
+		byteLength: Buffer.byteLength(encoded, "utf8"),
+	};
+}
+
+function asError(error: unknown): Error {
+	return error instanceof Error ? error : new Error(String(error));
 }
 
 function touchTask(task: AgentTask): AgentTask {

@@ -175,6 +175,19 @@ async def delegate(prompt: str, task: dict[str, Any], **kwargs: Any) -> RLMSpawn
     return _spawn_handle_from_payload(payload)
 
 
+async def replace(task_id: str, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
+    """Atomically replace the runtime owning an existing supervised task."""
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise TypeError("task_id must be a non-empty str")
+    if not isinstance(prompt, str):
+        raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
+    payload = await host_request(
+        "rlm.replace",
+        {"task_id": task_id.strip(), "prompt": prompt, "kwargs": kwargs},
+    )
+    return _spawn_handle_from_payload(payload)
+
+
 class _RLMTaskAPI:
     async def current(self) -> dict[str, Any]:
         """Return this agent's task and complete inherited context envelope."""
@@ -187,6 +200,14 @@ class _RLMTaskAPI:
         if not isinstance(limit, int):
             raise TypeError(f"limit must be int, got {type(limit).__name__}")
         return await host_request("rlm.task.snapshot", {"offset": offset, "limit": limit})
+
+    async def root_context(self) -> dict[str, Any] | None:
+        """Resolve the complete immutable root context on demand."""
+        payload = await host_request("rlm.task.root_context")
+        value = payload.get("rootContext")
+        if value is not None and not isinstance(value, dict):
+            raise RuntimeError("rlm.task.root_context returned an invalid context")
+        return value
 
     async def update(
         self,
@@ -248,14 +269,6 @@ class _RLMTaskAPI:
     async def cancel(self, task_id: str, reason: str) -> dict[str, Any]:
         """Cancel a directly supervised task; the root may cancel any descendant."""
         return await host_request("rlm.task.cancel", {"task_id": task_id, "reason": reason})
-
-    async def reassign(self, task_id: str, owner_agent_id: str) -> dict[str, Any]:
-        """Reassign a directly supervised task; the root may reassign any descendant."""
-        return await host_request(
-            "rlm.task.reassign",
-            {"task_id": task_id, "owner_agent_id": owner_agent_id},
-        )
-
 
 def _model_from_payload(payload: Any) -> RLMModel:
     if not isinstance(payload, dict):
@@ -402,6 +415,9 @@ class _RLMCallable:
     async def delegate(self, prompt: str, task: dict[str, Any], **kwargs: Any) -> RLMSpawnHandle:
         return await delegate(prompt, task, **kwargs)
 
+    async def replace(self, task_id: str, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
+        return await replace(task_id, prompt, **kwargs)
+
     async def find_models(self, query: str = "", limit: int = 8) -> list[RLMModel]:
         return await find_models(query, limit)
 
@@ -444,6 +460,7 @@ __all__ = [
     "harness",
     "host_request",
     "list_subagents",
+    "replace",
     "rlm",
     "run",
 ]

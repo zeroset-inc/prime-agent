@@ -221,6 +221,7 @@ import {
 	createRlmDeleteSubagentHostHandler,
 	createRlmFindModelsHostHandler,
 	createRlmListSubagentsHostHandler,
+	createRlmReplaceHostHandler,
 	createRlmRunHostHandler,
 	findRlmModelMatches,
 	normalizeRequestedRlmSubagentModel,
@@ -229,6 +230,7 @@ import {
 	type RlmFindModelsResult,
 	type RlmListSubagentsResult,
 	type RlmSpawnHandle,
+	type RlmSubagentCapacityPool,
 	type RlmSubagentRegistryEntry,
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
@@ -486,6 +488,10 @@ export interface AgentSessionConfig {
 	taskGraph?: AgentTaskGraph;
 	/** Task owned by this session inside taskGraph. */
 	taskId?: string;
+	/** Immutable actor identity authorized for task mutations in this session. */
+	taskActorId?: string;
+	/** Shared capacity acquired for every child turn, including retained follow-ups. */
+	turnCapacityPool?: RlmSubagentCapacityPool;
 	/** Host responsible for creating RLM subagent runtimes. */
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	/** Host-side autonomous continuation policy. */
@@ -1262,7 +1268,9 @@ export class AgentSession {
 	private _rlmParentAgent?: string;
 	private readonly _taskGraph?: AgentTaskGraph;
 	private readonly _taskId?: string;
-	private _taskGraphError?: Error;
+	private readonly _taskActorId?: string;
+	private readonly _turnCapacityPool?: RlmSubagentCapacityPool;
+	private _taskAccountingError?: Error;
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
@@ -1378,6 +1386,10 @@ export class AgentSession {
 		this._rlmParentAgent = config.rlmParentAgent;
 		this._taskGraph = config.taskGraph;
 		this._taskId = config.taskId;
+		this._taskActorId =
+			config.taskActorId ??
+			(this._taskGraph && this._taskId ? this._taskGraph.getTask(this._taskId).ownerAgentId : undefined);
+		this._turnCapacityPool = config.turnCapacityPool;
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -3371,7 +3383,8 @@ export class AgentSession {
 			event.message.stopReason !== "error" &&
 			event.message.stopReason !== "aborted" &&
 			this._taskGraph &&
-			this._taskId
+			this._taskId &&
+			this._taskActorId
 		) {
 			try {
 				this._taskGraph.recordUsage(
@@ -3383,10 +3396,11 @@ export class AgentSession {
 						cacheWrite: event.message.usage.cacheWrite,
 						cost: event.message.usage.cost.total,
 					},
-					this._taskGraph.getTask(this._taskId).ownerAgentId,
+					this._taskActorId,
 				);
+				this._taskAccountingError = undefined;
 			} catch (error) {
-				this._taskGraphError = error instanceof Error ? error : new Error(String(error));
+				this._taskAccountingError = error instanceof Error ? error : new Error(String(error));
 			}
 		}
 		if (event.type === "message_start" || event.type === "message_end") {
@@ -4282,8 +4296,20 @@ export class AgentSession {
 		return this._taskId;
 	}
 
+	/** Immutable actor identity authorized for this session's task operations. */
+	get taskActorId(): string | undefined {
+		return this._taskActorId;
+	}
+
 	get taskGraphError(): Error | undefined {
-		return this._taskGraphError;
+		const health = this._taskGraph?.getHealth();
+		return health && health.status !== "healthy"
+			? new Error(health.error ?? `task graph is ${health.status}`)
+			: undefined;
+	}
+
+	get taskAccountingError(): Error | undefined {
+		return this._taskAccountingError;
 	}
 
 	/** Current session display name, if set */
@@ -5768,6 +5794,7 @@ export class AgentSession {
 
 	private async _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
 		let nextTurnMessages: CustomMessage[] = [];
+		let turnCapacityLeaseId: string | undefined;
 		const activeTurns = () =>
 			actions.filter(
 				(action): action is SessionAction<PreparedTurnPayload> =>
@@ -5829,6 +5856,13 @@ export class AgentSession {
 				return;
 			}
 			const { prepared, turns } = preparedTurn;
+			if (this._turnCapacityPool) {
+				turnCapacityLeaseId = `${this._taskActorId ?? this.sessionId}:turn:${randomUUID()}`;
+				await this._turnCapacityPool.acquire(
+					turnCapacityLeaseId,
+					this._sessionActionCommitDisposeAbortController.signal,
+				);
+			}
 			const commitFence = await this._acquireSessionActionCommitFence();
 			let promptPromise: Promise<void>;
 			try {
@@ -5895,6 +5929,8 @@ export class AgentSession {
 				}
 			}
 			throw error;
+		} finally {
+			if (turnCapacityLeaseId) this._turnCapacityPool?.release(turnCapacityLeaseId);
 		}
 	}
 
@@ -7521,13 +7557,24 @@ export class AgentSession {
 
 		this._postCompactionContinuationScheduled = false;
 		try {
-			await this.agent.continue();
+			await this._withTurnCapacity(() => this.agent.continue());
 			this._forgetConsumedPostCompactionContinuations(continuationMessages);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (message.includes("already processing")) {
 				this._schedulePostCompactionContinue();
 			}
+		}
+	}
+
+	private async _withTurnCapacity<T>(operation: () => Promise<T>): Promise<T> {
+		if (!this._turnCapacityPool) return operation();
+		const leaseId = `${this._taskActorId ?? this.sessionId}:turn:${randomUUID()}`;
+		await this._turnCapacityPool.acquire(leaseId, this._sessionActionCommitDisposeAbortController.signal);
+		try {
+			return await operation();
+		} finally {
+			this._turnCapacityPool.release(leaseId);
 		}
 	}
 
@@ -8868,15 +8915,18 @@ export class AgentSession {
 			handlers["rlm.delegate"] = createRlmDelegateHostHandler(async ({ prompt, task, kwargs, cellSourceCode }) => ({
 				...(await this.delegateRlmChild(prompt, task, kwargs, cellSourceCode)),
 			}));
+			handlers["rlm.replace"] = createRlmReplaceHostHandler(async ({ prompt, taskId, kwargs, cellSourceCode }) => ({
+				...(await this.replaceRlmTask(taskId, prompt, kwargs, cellSourceCode)),
+			}));
 			for (const type of [
 				"rlm.task.current",
 				"rlm.task.snapshot",
+				"rlm.task.root_context",
 				"rlm.task.update",
 				"rlm.task.complete",
 				"rlm.task.report_gap",
 				"rlm.task.resolve_gap",
 				"rlm.task.cancel",
-				"rlm.task.reassign",
 			]) {
 				handlers[type] = async (payload) => this.handleAgentTaskHostRequest(type, payload);
 			}
@@ -8974,9 +9024,10 @@ export class AgentSession {
 	private handleAgentTaskHostRequest(type: string, payload: Record<string, unknown>): Record<string, unknown> {
 		const graph = this._taskGraph;
 		const taskId = this._taskId;
-		if (!graph || !taskId) throw new Error("durable task coordination is not enabled for this session");
-		if (this._taskGraphError) throw new Error(`durable task coordination failed: ${this._taskGraphError.message}`);
-		const callerAgentId = graph.getTask(taskId).ownerAgentId;
+		const callerAgentId = this._taskActorId;
+		if (!graph || !taskId || !callerAgentId) {
+			throw new Error("durable task coordination is not enabled for this session");
+		}
 		switch (type) {
 			case "rlm.task.current":
 				return { task: graph.getCurrentTask(taskId, callerAgentId), context: graph.contextEnvelope(taskId) };
@@ -8987,7 +9038,10 @@ export class AgentSession {
 						limit: optionalNumber(payload.limit, "limit"),
 					}),
 					supervisionAlerts: graph.getSupervisionAlerts(),
+					health: graph.getHealth(),
 				};
+			case "rlm.task.root_context":
+				return { rootContext: graph.getRootContext() ?? null };
 			case "rlm.task.update":
 				return {
 					task: graph.updateProgress(taskId, callerAgentId, {
@@ -9034,14 +9088,6 @@ export class AgentSession {
 						requiredString(payload.task_id, "task_id"),
 						callerAgentId,
 						requiredString(payload.reason, "reason"),
-					),
-				};
-			case "rlm.task.reassign":
-				return {
-					task: graph.reassignTask(
-						requiredString(payload.task_id, "task_id"),
-						callerAgentId,
-						requiredString(payload.owner_agent_id, "owner_agent_id"),
 					),
 				};
 			default:
@@ -9201,6 +9247,7 @@ export class AgentSession {
 		sessionDir: string;
 		model: Model<any>;
 		taskId?: string;
+		taskActorId?: string;
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
 			parentSession: this,
@@ -9223,6 +9270,7 @@ export class AgentSession {
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
 			taskId: options.taskId,
+			taskActorId: options.taskActorId,
 		};
 	}
 
@@ -9285,6 +9333,8 @@ export class AgentSession {
 			includeCompactSkill: options.includeCompactSkill,
 			taskGraph: this._taskGraph,
 			taskId: options.taskId,
+			taskActorId: options.taskActorId,
+			turnCapacityPool: options.turnCapacityPool,
 			rlmDepth: options.rlmDepth,
 			rlmMaxDepth: options.rlmMaxDepth,
 			rlmSessionDir: options.sessionDir,
@@ -9311,16 +9361,14 @@ export class AgentSession {
 		}
 	}
 
-	private _cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
+	private _cancelRlmChildRun(run: RlmChildRun, reason: string, preserveTask = false): boolean {
 		if (run.status !== "running" && run.status !== "queued") {
 			return false;
 		}
 		run.status = "cancelled";
 		run.error = reason;
-		if (run.taskId && this._taskGraph) {
-			const callerAgentId = this._taskId
-				? this._taskGraph.getTask(this._taskId).ownerAgentId
-				: this._taskGraph.rootAgentId;
+		if (!preserveTask && run.taskId && this._taskGraph) {
+			const callerAgentId = this._taskActorId ?? this._taskGraph.rootAgentId;
 			const task = this._taskGraph.getTask(run.taskId);
 			if (task.status !== "completed" && task.status !== "cancelled" && task.status !== "interrupted") {
 				this._taskGraph.cancelTask(run.taskId, callerAgentId, reason);
@@ -9333,6 +9381,24 @@ export class AgentSession {
 		// exactly when users reach for the kill.
 		run.emitUpdate?.();
 		return true;
+	}
+
+	private async _retireTaskRuntime(taskId: string, reason: string): Promise<void> {
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (run.taskId === taskId) this._cancelRlmChildRun(run, reason, true);
+		}
+		for (const [childId, session] of this._rlmChildSessions) {
+			if (session.taskId !== taskId) continue;
+			await session.abort().catch(() => undefined);
+			this._rlmChildUnsubscribes.get(childId)?.();
+			this._rlmChildUnsubscribes.delete(childId);
+			this._rlmChildSessions.delete(childId);
+			if (this._subagentRuntimeHost) {
+				await this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
+			} else {
+				await session.disposeAsync();
+			}
+		}
 	}
 
 	/** Status of a direct RLM child run, while the run is still tracked. */
@@ -9888,7 +9954,9 @@ export class AgentSession {
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
 		delegation?: AgentTaskDelegationInput,
+		replacementTaskId?: string,
 	): Promise<RlmSpawnHandle> {
+		if (delegation && replacementTaskId) throw new Error("cannot delegate and replace a task in one child run");
 		const { name: rawName, model: rawModel, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
@@ -9922,18 +9990,28 @@ export class AgentSession {
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
 		let delegatedTaskId: string | undefined;
+		let startsNewTask = false;
 		if (delegation) {
-			if (!this._taskGraph || !this._taskId) {
+			if (!this._taskGraph || !this._taskId || !this._taskActorId) {
 				throw new Error("rlm.delegate requires a durable task graph and a current task");
 			}
-			if (this._taskGraphError) throw new Error(`durable task coordination failed: ${this._taskGraphError.message}`);
-			const callerAgentId = this._taskGraph.getTask(this._taskId).ownerAgentId;
 			delegatedTaskId = this._taskGraph.reserveDelegation({
 				parentTaskId: this._taskId,
-				callerAgentId,
+				callerAgentId: this._taskActorId,
 				childAgentId: childNodeId,
 				task: delegation,
 			}).id;
+			startsNewTask = true;
+		} else if (replacementTaskId) {
+			if (!this._taskGraph || !this._taskId || !this._taskActorId) {
+				throw new Error("rlm.replace requires a durable task graph and a current task");
+			}
+			const task = this._taskGraph.getTask(replacementTaskId);
+			if (task.parentTaskId !== this._taskId && this._taskActorId !== this._taskGraph.rootAgentId) {
+				throw new Error(`task ${replacementTaskId} is not directly supervised by this session`);
+			}
+			delegatedTaskId = this._taskGraph.reassignTask(replacementTaskId, this._taskActorId, childNodeId).id;
+			await this._retireTaskRuntime(replacementTaskId, "Replaced by supervising agent").catch(() => undefined);
 		}
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
@@ -10003,6 +10081,7 @@ export class AgentSession {
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
 				taskId: delegatedTaskId,
+				taskActorId: delegatedTaskId ? childNodeId : undefined,
 			}),
 			onSessionPublished: publishChildSession,
 			signal: startupAbortController.signal,
@@ -10041,7 +10120,9 @@ export class AgentSession {
 				if (child.sessionName !== sessionName) child.setSessionName(sessionName);
 				publishChildSession(child);
 				throwIfCancelled();
-				if (delegatedTaskId && this._taskGraph) this._taskGraph.startTask(delegatedTaskId, childNodeId);
+				if (delegatedTaskId && startsNewTask && this._taskGraph) {
+					this._taskGraph.startTask(delegatedTaskId, childNodeId);
+				}
 				run.status = "running";
 				emitChildUpdate();
 				const unsubscribeChildEvents = child.subscribe((event) => {
@@ -10140,8 +10221,8 @@ export class AgentSession {
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
 				if (delegatedTaskId && this._taskGraph) {
-					const currentTask = this._taskGraph.getTask(delegatedTaskId);
-					if (currentTask.status !== "completed" && this._taskGraph.canAutoCompleteTask(delegatedTaskId)) {
+					const stillOwned = this._taskGraph.getTask(delegatedTaskId).ownerAgentId === childNodeId;
+					if (stillOwned && this._taskGraph.canAutoCompleteTask(delegatedTaskId)) {
 						this._taskGraph.completeTaskFromRuntime(
 							delegatedTaskId,
 							childNodeId,
@@ -10175,8 +10256,7 @@ export class AgentSession {
 			} catch (error) {
 				const runError = error instanceof Error ? error : new Error(String(error));
 				if (delegatedTaskId && this._taskGraph) {
-					const task = this._taskGraph.getTask(delegatedTaskId);
-					if (task.status !== "completed" && task.status !== "cancelled" && task.status !== "interrupted") {
+					if (this._taskGraph.getTask(delegatedTaskId).ownerAgentId === childNodeId) {
 						this._taskGraph.interruptTask(delegatedTaskId, childNodeId, runError.message);
 					}
 				}
@@ -10291,6 +10371,15 @@ export class AgentSession {
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
 		return this._startRlmChildRun(prompt, kwargs, spawnCode, task);
+	}
+
+	async replaceRlmTask(
+		taskId: string,
+		prompt: string,
+		kwargs: Record<string, unknown> = {},
+		spawnCode?: string,
+	): Promise<RlmSpawnHandle> {
+		return this._startRlmChildRun(prompt, kwargs, spawnCode, undefined, taskId);
 	}
 
 	// =========================================================================
@@ -10553,7 +10642,7 @@ export class AgentSession {
 
 		// Retry via continue() - use setTimeout to break out of event handler chain
 		setTimeout(() => {
-			this.agent.continue().catch(() => {
+			this._withTurnCapacity(() => this.agent.continue()).catch(() => {
 				// Retry failed - will be caught by next agent_end
 			});
 		}, 0);

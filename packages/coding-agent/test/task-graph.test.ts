@@ -60,6 +60,27 @@ describe("AgentTaskGraph", () => {
 		expect(readFileSync(join(directory!, "task-graph.events.jsonl"), "utf8")).toContain("task.delegated");
 	});
 
+	it("inherits a bounded projection while retaining full root context on demand", () => {
+		directory = mkdtempSync(join(tmpdir(), "prime-task-graph-"));
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review the change",
+				rootContext: { manifest: ["a.ts", "b.ts"], contract: "full" },
+				inheritedContext: { baseRevision: "base", headRevision: "head" },
+			},
+		});
+
+		const envelope = graph.contextEnvelope(graph.rootTaskId);
+		expect(envelope.rootContext).toEqual({ baseRevision: "base", headRevision: "head" });
+		expect(envelope.rootContextDescriptor).toMatchObject({
+			byteLength: expect.any(Number),
+			sha256: expect.any(String),
+		});
+		expect(graph.getRootContext()).toEqual({ manifest: ["a.ts", "b.ts"], contract: "full" });
+	});
+
 	it("rejects overlap, non-owned claims, duplicate work, and spoofed callers", () => {
 		const graph = open();
 		const input = {
@@ -212,6 +233,82 @@ describe("AgentTaskGraph", () => {
 		).toEqual(["b.ts", "c.ts"]);
 	});
 
+	it("persists root rebinding through a journal-only graph patch", () => {
+		const graph = open();
+		graph.rebindRootAgent("rebound-root");
+
+		const restored = AgentTaskGraph.open({
+			directory: directory!,
+			root: { ownerAgentId: "rebound-root", objective: "Review the change" },
+			policy: { requireExclusiveClaims: true },
+		});
+		expect(restored.rootAgentId).toBe("rebound-root");
+		expect(restored.getTask(restored.rootTaskId).ownerAgentId).toBe("rebound-root");
+	});
+
+	it("recovers pending and blocked tasks instead of stranding their claims", () => {
+		const graph = open();
+		const pending = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "pending-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent file",
+			},
+		});
+		const blocked = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "blocked-agent",
+			task: {
+				objective: "Review b.ts",
+				scope: "b.ts",
+				exclusiveClaims: [claim("b.ts")],
+				delegationReason: "Independent file",
+			},
+		});
+		graph.reportGap(blocked.id, "blocked-agent", { kind: "context", description: "Need generated data" });
+
+		const restored = AgentTaskGraph.open({
+			directory: directory!,
+			root: { ownerAgentId: "restored-root", objective: "Review the change" },
+			policy: { requireExclusiveClaims: true },
+		});
+		expect(restored.getTask(pending.id).status).toBe("interrupted");
+		expect(restored.getTask(blocked.id).status).toBe("interrupted");
+		expect(
+			restored
+				.getTask(restored.rootTaskId)
+				.exclusiveClaims.map((item) => item.key)
+				.sort(),
+		).toEqual(["a.ts", "b.ts", "c.ts"]);
+	});
+
+	it("replays compact usage deltas and checkpoints them into the snapshot", () => {
+		const graph = open();
+		graph.recordUsage(graph.rootTaskId, { input: 10, output: 3, cacheRead: 4, cost: 0.25 }, "root-agent");
+		const journal = readFileSync(join(directory!, "task-graph.events.jsonl"), "utf8");
+		expect(journal).toContain('"usageDelta"');
+		expect(journal).toContain('"tasks":[]');
+
+		const restored = AgentTaskGraph.open({
+			directory: directory!,
+			root: { ownerAgentId: "root-agent", objective: "Review the change" },
+			policy: { requireExclusiveClaims: true },
+		});
+		expect(restored.getTask(restored.rootTaskId).usage).toMatchObject({
+			input: 10,
+			output: 3,
+			cacheRead: 4,
+			cost: 0.25,
+		});
+		restored.checkpoint();
+		expect(readFileSync(join(directory!, "task-graph.events.jsonl"), "utf8")).toBe("");
+	});
+
 	it("recovers an active recursive subtree once without resurrecting its coordinator", () => {
 		const graph = open();
 		const child = graph.reserveDelegation({
@@ -280,6 +377,48 @@ describe("AgentTaskGraph", () => {
 		});
 		graph.completeTaskFromRuntime(child.id, "child-agent", "Verified");
 		expect(() => graph.assertDelegatedTasksComplete()).not.toThrow();
+	});
+
+	it("bounds unstructured runtime conclusions without turning success into interruption", () => {
+		const graph = open();
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent file",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		const completed = graph.completeTaskFromRuntime(child.id, "child-agent", "x".repeat(8_000));
+		expect(completed.status).toBe("completed");
+		expect(completed.result?.summary.length).toBeLessThanOrEqual(4_000);
+		expect(completed.result?.summary).toContain("[truncated by task runtime]");
+	});
+
+	it("revokes the previous actor immediately when a task is reassigned", () => {
+		const graph = open();
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "old-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent file",
+			},
+		});
+		graph.reassignTask(child.id, "root-agent", "new-agent");
+		expect(() => graph.updateProgress(child.id, "old-agent", { summary: "Still working" })).toThrow(
+			"does not own task",
+		);
+		expect(graph.updateProgress(child.id, "new-agent", { summary: "Replacement working" }).ownerAgentId).toBe(
+			"new-agent",
+		);
 	});
 
 	it("surfaces generic root-visible supervision signals without taking workflow decisions", () => {
