@@ -253,7 +253,7 @@ jobs:
           fi
 
       - name: Publish production channel to R2
-        if: env.PUBLISH_PRODUCTION == 'true'
+        if: env.PUBLISH_PRODUCTION == 'true' && env.R2_BUCKET != '' && env.R2_ENDPOINT_URL != ''
         run: |
           PRODUCTION_DIR=release-artifacts/production
           RELEASE_PREFIX="releases/v${PRODUCTION_VERSION}"
@@ -321,7 +321,7 @@ jobs:
           fi
 
       - name: Publish immutable beta artifacts to R2
-        if: env.PUBLISH_BETA == 'true'
+        if: env.PUBLISH_BETA == 'true' && env.R2_BUCKET != '' && env.R2_ENDPOINT_URL != ''
         run: |
           BETA_DIR=release-artifacts/beta
           RELEASE_PREFIX="releases/v${BETA_VERSION}"

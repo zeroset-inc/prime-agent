@@ -156,6 +156,9 @@ function npmTarballName(packageName, version) {
 }
 
 function releaseTarballUrl(baseUrl, version, tarballFile) {
+	if (baseUrl.endsWith("/releases/download")) {
+		return `${baseUrl}/v${version}/${tarballFile}`;
+	}
 	return `${baseUrl}/releases/v${version}/${tarballFile}`;
 }
 
