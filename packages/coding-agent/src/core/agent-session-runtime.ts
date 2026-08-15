@@ -57,6 +57,7 @@ export interface AgentSessionRuntimeMetadata {
 	parentSessionFile?: string;
 	rlmChildId?: string;
 	rlmParentNodeId?: string;
+	taskId?: string;
 	/** Runtime restored from an already-persisted completed registry entry. */
 	rehydratedCompleted?: boolean;
 	prompt?: string;
@@ -362,6 +363,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					rlmSessionDir: options.sessionDir,
 					rlmParentNodeId: options.rlmParentNodeId,
 					rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+					taskGraph: options.parentSession.taskGraph,
+					taskId: options.taskId,
 				},
 				runtimeMetadata: {
 					kind: "subagent",
@@ -370,6 +373,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					parentSessionFile: options.parentSession.sessionFile,
 					rlmChildId: options.id,
 					rlmParentNodeId: options.rlmParentNodeId,
+					taskId: options.taskId,
 					prompt: options.prompt,
 					spawnCode: options.spawnCode,
 					sessionDir: options.sessionDir,

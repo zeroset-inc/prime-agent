@@ -217,6 +217,7 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.j
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
+	createRlmDelegateHostHandler,
 	createRlmDeleteSubagentHostHandler,
 	createRlmFindModelsHostHandler,
 	createRlmListSubagentsHostHandler,
@@ -269,6 +270,12 @@ import {
 } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
+import {
+	type AgentTaskDelegationInput,
+	type AgentTaskGraph,
+	type AgentTaskResult,
+	formatAgentTaskContextEnvelope,
+} from "./task-graph.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
@@ -311,6 +318,8 @@ export interface RlmChildAgentSnapshot {
 	repliedSinceTask?: boolean;
 	/** Failure reason when status is "error". */
 	error?: string;
+	/** Durable task owned by this child, when coordinated delegation is active. */
+	taskId?: string;
 }
 
 export type CompactionReason = "manual" | "threshold" | "overflow" | "requested";
@@ -473,6 +482,10 @@ export interface AgentSessionConfig {
 	rlmParentNodeId?: string;
 	/** Parent agent name/id shown in child communication doctrine. */
 	rlmParentAgent?: string;
+	/** Shared durable task graph for this run. */
+	taskGraph?: AgentTaskGraph;
+	/** Task owned by this session inside taskGraph. */
+	taskId?: string;
 	/** Host responsible for creating RLM subagent runtimes. */
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	/** Host-side autonomous continuation policy. */
@@ -952,6 +965,7 @@ interface RlmChildRun {
 	emitUpdate?: () => void;
 	/** Idempotent child-event forwarder cleanup, once the child runtime exists. */
 	unsubscribe?: () => void;
+	taskId?: string;
 }
 
 interface RlmSubagentModelSelection {
@@ -971,6 +985,40 @@ const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
+
+function requiredString(value: unknown, field: string): string {
+	if (typeof value !== "string" || !value.trim()) throw new Error(`${field} must be a non-empty string`);
+	return value.trim();
+}
+
+function optionalNumber(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number") throw new Error(`${field} must be a number`);
+	return value;
+}
+
+function optionalStringArray(value: unknown, field: string): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+		throw new Error(`${field} must be an array of strings`);
+	}
+	return value as string[];
+}
+
+function requiredRecord(value: unknown, field: string): Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${field} must be an object`);
+	return value as Record<string, unknown>;
+}
+
+function requiredGapKind(value: unknown): "coverage" | "context" | "dependency" | "other" {
+	if (value === "coverage" || value === "context" || value === "dependency" || value === "other") return value;
+	throw new Error("kind must be coverage, context, dependency, or other");
+}
+
+function requiredResolutionStatus(value: unknown): "resolved" | "declined" {
+	if (value === "resolved" || value === "declined") return value;
+	throw new Error("status must be resolved or declined");
+}
 
 function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineReview): string {
 	const detail = review.instructions
@@ -1212,6 +1260,9 @@ export class AgentSession {
 	private _rlmSessionDir?: string;
 	private _rlmParentNodeId?: string;
 	private _rlmParentAgent?: string;
+	private readonly _taskGraph?: AgentTaskGraph;
+	private readonly _taskId?: string;
+	private _taskGraphError?: Error;
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
@@ -1325,6 +1376,8 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._rlmParentAgent = config.rlmParentAgent;
+		this._taskGraph = config.taskGraph;
+		this._taskId = config.taskId;
 		// A resumed child may have replied before this process started; false would
 		// claim knowledge that is not present in the session transcript.
 		this._repliedToParentSinceTask =
@@ -3312,6 +3365,30 @@ export class AgentSession {
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = (event: AgentEvent): void => {
 		this._createRetryPromiseForAgentEnd(event);
+		if (
+			event.type === "message_end" &&
+			event.message.role === "assistant" &&
+			event.message.stopReason !== "error" &&
+			event.message.stopReason !== "aborted" &&
+			this._taskGraph &&
+			this._taskId
+		) {
+			try {
+				this._taskGraph.recordUsage(
+					this._taskId,
+					{
+						input: event.message.usage.input,
+						output: event.message.usage.output,
+						cacheRead: event.message.usage.cacheRead,
+						cacheWrite: event.message.usage.cacheWrite,
+						cost: event.message.usage.cost.total,
+					},
+					this._taskGraph.getTask(this._taskId).ownerAgentId,
+				);
+			} catch (error) {
+				this._taskGraphError = error instanceof Error ? error : new Error(String(error));
+			}
+		}
 		if (event.type === "message_start" || event.type === "message_end") {
 			for (const action of this._actionStore.ownedActions()) {
 				if (
@@ -4195,6 +4272,20 @@ export class AgentSession {
 		return this._rlmMaxDepth;
 	}
 
+	/** Shared durable task graph for this run, when coordinated delegation is enabled. */
+	get taskGraph(): AgentTaskGraph | undefined {
+		return this._taskGraph;
+	}
+
+	/** Task owned by this session inside taskGraph. */
+	get taskId(): string | undefined {
+		return this._taskId;
+	}
+
+	get taskGraphError(): Error | undefined {
+		return this._taskGraphError;
+	}
+
 	/** Current session display name, if set */
 	get sessionName(): string | undefined {
 		return this.sessionManager.getSessionName();
@@ -4309,6 +4400,7 @@ export class AgentSession {
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
 			rlmDepth: this._rlmDepth,
 			rlmParentAgent: this._rlmParentAgent,
+			coordinatedTasks: Boolean(this._taskGraph && this._taskId),
 			harnessState: this._loadMergedHarnessState(),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
@@ -8772,6 +8864,23 @@ export class AgentSession {
 				input: this.model?.input ?? [],
 			}),
 		};
+		if (this._taskGraph && this._taskId) {
+			handlers["rlm.delegate"] = createRlmDelegateHostHandler(async ({ prompt, task, kwargs, cellSourceCode }) => ({
+				...(await this.delegateRlmChild(prompt, task, kwargs, cellSourceCode)),
+			}));
+			for (const type of [
+				"rlm.task.current",
+				"rlm.task.snapshot",
+				"rlm.task.update",
+				"rlm.task.complete",
+				"rlm.task.report_gap",
+				"rlm.task.resolve_gap",
+				"rlm.task.cancel",
+				"rlm.task.reassign",
+			]) {
+				handlers[type] = async (payload) => this.handleAgentTaskHostRequest(type, payload);
+			}
+		}
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
 				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
@@ -8860,6 +8969,84 @@ export class AgentSession {
 			Object.assign(handlers, this._mcpManager.hostHandlers());
 		}
 		return handlers;
+	}
+
+	private handleAgentTaskHostRequest(type: string, payload: Record<string, unknown>): Record<string, unknown> {
+		const graph = this._taskGraph;
+		const taskId = this._taskId;
+		if (!graph || !taskId) throw new Error("durable task coordination is not enabled for this session");
+		if (this._taskGraphError) throw new Error(`durable task coordination failed: ${this._taskGraphError.message}`);
+		const callerAgentId = graph.getTask(taskId).ownerAgentId;
+		switch (type) {
+			case "rlm.task.current":
+				return { task: graph.getCurrentTask(taskId, callerAgentId), context: graph.contextEnvelope(taskId) };
+			case "rlm.task.snapshot":
+				return {
+					snapshot: graph.getSnapshot({
+						offset: optionalNumber(payload.offset, "offset"),
+						limit: optionalNumber(payload.limit, "limit"),
+					}),
+					supervisionAlerts: graph.getSupervisionAlerts(),
+				};
+			case "rlm.task.update":
+				return {
+					task: graph.updateProgress(taskId, callerAgentId, {
+						summary: requiredString(payload.summary, "summary"),
+						evidenceRefs: optionalStringArray(payload.evidence_refs, "evidence_refs"),
+						completedQuestions: optionalStringArray(payload.completed_questions, "completed_questions"),
+					}),
+				};
+			case "rlm.task.complete":
+				return {
+					task: graph.completeTask(
+						taskId,
+						callerAgentId,
+						requiredRecord(payload.result, "result") as unknown as AgentTaskResult,
+					),
+				};
+			case "rlm.task.report_gap":
+				return {
+					gap: graph.reportGap(taskId, callerAgentId, {
+						kind: requiredGapKind(payload.kind),
+						description: requiredString(payload.description, "description"),
+						...(typeof payload.needed_information === "string"
+							? { neededInformation: payload.needed_information }
+							: {}),
+						evidenceRefs: optionalStringArray(payload.evidence_refs, "evidence_refs"),
+					}),
+				};
+			case "rlm.task.resolve_gap":
+				return {
+					gap: graph.resolveGap(
+						requiredString(payload.task_id, "task_id"),
+						requiredString(payload.gap_id, "gap_id"),
+						callerAgentId,
+						{
+							status: requiredResolutionStatus(payload.status),
+							resolution: requiredString(payload.resolution, "resolution"),
+							evidenceRefs: optionalStringArray(payload.evidence_refs, "evidence_refs"),
+						},
+					),
+				};
+			case "rlm.task.cancel":
+				return {
+					task: graph.cancelTask(
+						requiredString(payload.task_id, "task_id"),
+						callerAgentId,
+						requiredString(payload.reason, "reason"),
+					),
+				};
+			case "rlm.task.reassign":
+				return {
+					task: graph.reassignTask(
+						requiredString(payload.task_id, "task_id"),
+						callerAgentId,
+						requiredString(payload.owner_agent_id, "owner_agent_id"),
+					),
+				};
+			default:
+				throw new Error(`unsupported task host request: ${type}`);
+		}
 	}
 
 	async reload(): Promise<void> {
@@ -9013,6 +9200,7 @@ export class AgentSession {
 		spawnCode?: string;
 		sessionDir: string;
 		model: Model<any>;
+		taskId?: string;
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
 			parentSession: this,
@@ -9034,6 +9222,7 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth + 1,
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
+			taskId: options.taskId,
 		};
 	}
 
@@ -9094,6 +9283,8 @@ export class AgentSession {
 			allowedToolNames: options.allowedToolNames,
 			includeGoals: options.includeGoals,
 			includeCompactSkill: options.includeCompactSkill,
+			taskGraph: this._taskGraph,
+			taskId: options.taskId,
 			rlmDepth: options.rlmDepth,
 			rlmMaxDepth: options.rlmMaxDepth,
 			rlmSessionDir: options.sessionDir,
@@ -9126,6 +9317,15 @@ export class AgentSession {
 		}
 		run.status = "cancelled";
 		run.error = reason;
+		if (run.taskId && this._taskGraph) {
+			const callerAgentId = this._taskId
+				? this._taskGraph.getTask(this._taskId).ownerAgentId
+				: this._taskGraph.rootAgentId;
+			const task = this._taskGraph.getTask(run.taskId);
+			if (task.status !== "completed" && task.status !== "cancelled" && task.status !== "interrupted") {
+				this._taskGraph.cancelTask(run.taskId, callerAgentId, reason);
+			}
+		}
 		run.publication.reject(new Error(reason));
 		run.abort();
 		// Surface the cancellation immediately; the run's own terminal update is
@@ -9194,6 +9394,7 @@ export class AgentSession {
 				session_name: daemonChild?.sessionName ?? run.session?.sessionName ?? run.sessionName,
 				session_dir: run.sessionDir,
 				status: run.status === "done" ? "completed" : run.status === "error" ? "error" : "running",
+				...(run.taskId ? { task_id: run.taskId } : {}),
 			});
 			recorded.add(run.id);
 		}
@@ -9218,6 +9419,7 @@ export class AgentSession {
 					daemonChild?.sessionName ?? childSession.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: sessionDir,
 				status: "completed",
+				...(childSession.taskId ? { task_id: childSession.taskId } : {}),
 			});
 			recorded.add(childId);
 		}
@@ -9685,6 +9887,7 @@ export class AgentSession {
 		prompt: string,
 		kwargs: Record<string, unknown> = {},
 		spawnCode?: string,
+		delegation?: AgentTaskDelegationInput,
 	): Promise<RlmSpawnHandle> {
 		const { name: rawName, model: rawModel, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
@@ -9718,6 +9921,20 @@ export class AgentSession {
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
+		let delegatedTaskId: string | undefined;
+		if (delegation) {
+			if (!this._taskGraph || !this._taskId) {
+				throw new Error("rlm.delegate requires a durable task graph and a current task");
+			}
+			if (this._taskGraphError) throw new Error(`durable task coordination failed: ${this._taskGraphError.message}`);
+			const callerAgentId = this._taskGraph.getTask(this._taskId).ownerAgentId;
+			delegatedTaskId = this._taskGraph.reserveDelegation({
+				parentTaskId: this._taskId,
+				callerAgentId,
+				childAgentId: childNodeId,
+				task: delegation,
+			}).id;
+		}
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);
@@ -9727,6 +9944,7 @@ export class AgentSession {
 		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
 		let childSession: AgentSession | undefined;
+		const startupAbortController = new AbortController();
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
@@ -9734,8 +9952,9 @@ export class AgentSession {
 			sessionDir: childSessionDir,
 			status: "queued",
 			settled: false,
-			abort: noopRlmChildAbort,
+			abort: () => startupAbortController.abort(),
 			publication: createAgentMessageDeferred(),
+			...(delegatedTaskId ? { taskId: delegatedTaskId } : {}),
 		};
 		const throwIfCancelled = () => {
 			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
@@ -9761,6 +9980,7 @@ export class AgentSession {
 					activity,
 					repliedSinceTask: childSession?._repliedToParentSinceTask,
 					error: run.error,
+					taskId: run.taskId,
 				},
 			});
 		};
@@ -9782,8 +10002,10 @@ export class AgentSession {
 				spawnCode,
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
+				taskId: delegatedTaskId,
 			}),
 			onSessionPublished: publishChildSession,
+			signal: startupAbortController.signal,
 		};
 
 		const deliverTerminalMessageToParent = async (message: CustomMessage): Promise<void> => {
@@ -9819,6 +10041,7 @@ export class AgentSession {
 				if (child.sessionName !== sessionName) child.setSessionName(sessionName);
 				publishChildSession(child);
 				throwIfCancelled();
+				if (delegatedTaskId && this._taskGraph) this._taskGraph.startTask(delegatedTaskId, childNodeId);
 				run.status = "running";
 				emitChildUpdate();
 				const unsubscribeChildEvents = child.subscribe((event) => {
@@ -9885,7 +10108,11 @@ export class AgentSession {
 					}
 				});
 				run.unsubscribe = unsubscribeChildEvents;
-				const content = `[task from parent]\n\n${prompt}`;
+				const taskContext =
+					delegatedTaskId && this._taskGraph
+						? `${formatAgentTaskContextEnvelope(this._taskGraph.contextEnvelope(delegatedTaskId))}\n\n`
+						: "";
+				const content = `[task from parent]\n\n${taskContext}${prompt}`;
 				const spawnMessage: AgentSessionMessage = {
 					role: "custom",
 					customType: AGENT_MESSAGE_CUSTOM_TYPE,
@@ -9912,6 +10139,16 @@ export class AgentSession {
 				});
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
+				if (delegatedTaskId && this._taskGraph) {
+					const currentTask = this._taskGraph.getTask(delegatedTaskId);
+					if (currentTask.status !== "completed" && this._taskGraph.canAutoCompleteTask(delegatedTaskId)) {
+						this._taskGraph.completeTaskFromRuntime(
+							delegatedTaskId,
+							childNodeId,
+							child.getLastAssistantText() ?? "Task completed without a textual result.",
+						);
+					}
+				}
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
@@ -9937,6 +10174,12 @@ export class AgentSession {
 				}
 			} catch (error) {
 				const runError = error instanceof Error ? error : new Error(String(error));
+				if (delegatedTaskId && this._taskGraph) {
+					const task = this._taskGraph.getTask(delegatedTaskId);
+					if (task.status !== "completed" && task.status !== "cancelled" && task.status !== "interrupted") {
+						this._taskGraph.interruptTask(delegatedTaskId, childNodeId, runError.message);
+					}
+				}
 				run.publication.reject(runError);
 				if (run.status !== "cancelled") {
 					run.status = "error";
@@ -10029,6 +10272,7 @@ export class AgentSession {
 			name: sessionName,
 			session_dir: childSessionDir,
 			model: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+			...(delegatedTaskId ? { task_id: delegatedTaskId } : {}),
 		};
 	}
 
@@ -10038,6 +10282,15 @@ export class AgentSession {
 		spawnCode?: string,
 	): Promise<RlmSpawnHandle> {
 		return this._startRlmChildRun(prompt, kwargs, spawnCode);
+	}
+
+	async delegateRlmChild(
+		prompt: string,
+		task: AgentTaskDelegationInput,
+		kwargs: Record<string, unknown> = {},
+		spawnCode?: string,
+	): Promise<RlmSpawnHandle> {
+		return this._startRlmChildRun(prompt, kwargs, spawnCode, task);
 	}
 
 	// =========================================================================

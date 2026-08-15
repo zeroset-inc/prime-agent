@@ -80,6 +80,7 @@ export {
 export type { RefinementResult } from "./refinement/index.js";
 export type {
 	CreateRlmSubagentRuntimeOptions,
+	PolicyControlledSubagentRuntimeHostOptions,
 	RlmSubagentAdmissionDecision,
 	RlmSubagentAdmissionPolicy,
 	RlmSubagentAdmissionRequest,
@@ -94,7 +95,9 @@ export {
 	createPolicyControlledSubagentRuntimeHost,
 	PolicyControlledSubagentRuntimeHost,
 	RlmSubagentAdmissionError,
+	RlmSubagentCapacityPool,
 } from "./rlm-runtime.js";
 export { SessionImportFileNotFoundError } from "./session-import-errors.js";
 export type { SessionStats } from "./session-stats.js";
 export { createSyntheticSourceInfo } from "./source-info.js";
+export * from "./task-graph.js";

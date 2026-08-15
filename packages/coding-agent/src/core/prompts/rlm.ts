@@ -9,6 +9,7 @@ export interface RlmPromptOptions {
 	depth?: number;
 	parentAgent?: string;
 	activeTools?: string[];
+	coordinatedTasks?: boolean;
 }
 
 const IPYTHON_CONTROL_PROMPT = [
@@ -38,6 +39,7 @@ export interface ChildAgentDoctrineOptions {
 	parentAgent?: string;
 	installedSkills?: string[];
 	activeTools?: string[];
+	coordinatedTasks?: boolean;
 }
 
 export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): string | undefined {
@@ -52,6 +54,11 @@ export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): str
 	if (hasAgentMessage && hasIpython) {
 		lines.push(
 			'When a task calls for an answer, reply explicitly with `await agent_message.send(message, receiver_role="parent")`. Not every message or task needs a reply; continue cleanup after sending and go idle normally.',
+		);
+	}
+	if (options.coordinatedTasks && hasIpython) {
+		lines.push(
+			"Your complete owned assignment is available through `await rlm.task.current()`. Report bounded progress, evidence references, and context gaps through `rlm.task`; complete the task with a structured result before going idle.",
 		);
 	}
 	return lines.join("\n");
@@ -130,6 +137,13 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			"Choose a stable child name with `await rlm('sub-task', name='api-reviewer')`; names must be unique among siblings. If omitted, the host generates a readable unique name.",
 			"A child inherits your model. If a different model is explicitly requested, use `await rlm.find_models(...)` and an exact returned selector. An unavailable requested model fails spawn; decide whether to retry or omit `model`.",
 		);
+		if (options.coordinatedTasks) {
+			parts.push(
+				"This run has a durable task graph. Inspect it with `await rlm.task.current()` and `await rlm.task.snapshot()`; snapshots include generic supervision alerts for blocked, stalled, uncertain, or synthesis-ready tasks.",
+				"Delegate coordinated work with `await rlm.delegate(prompt, task={...})`. The task must be genuinely narrower, transfer exclusive claims you own, include explicit scope and exclusions, and include enough context to avoid repository-wide rediscovery.",
+				"After transfer, coordinate that scope instead of repeating it. Children may recursively delegate under the same ownership rule. Direct parents supervise their children and the root can supervise the whole tree. Report missing context with `await rlm.task.report_gap(...)`, persist progress with `await rlm.task.update(...)`, and finish with `await rlm.task.complete(result)`.",
+			);
+		}
 		if (hasAgentMessage) {
 			parts.push(
 				"Children reply explicitly with `await agent_message.send(message, receiver_role='parent')` when an answer is needed. Replies and follow-ups arrive as ordinary agent messages; not every task requires a reply.",
@@ -172,7 +186,12 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
  * harness-state block.
  */
 export function buildSubagentGuidance(
-	options: { includeRefineExamples?: boolean; hasAgentMessage?: boolean; hasAgentObserve?: boolean } = {},
+	options: {
+		includeRefineExamples?: boolean;
+		hasAgentMessage?: boolean;
+		hasAgentObserve?: boolean;
+		coordinatedTasks?: boolean;
+	} = {},
 ): string {
 	const lines = [
 		"# Delegating to sub-agents",
@@ -192,6 +211,12 @@ export function buildSubagentGuidance(
 		"Have children write files and read those files for fan-in.",
 		"Delegate parallel context-heavy research or independent implementation; do a single known lookup, edit, or command inline.",
 	);
+	if (options.coordinatedTasks) {
+		lines.push(
+			"For owned work, prefer `rlm.delegate(...)`: Prime atomically transfers exclusive claims, persists inherited context, and binds the child to the new task. Use plain `rlm(...)` only for work that intentionally has no ownership contract.",
+			"Every task may decompose recursively, but responsibility must strictly narrow and the delegating parent must stop broad exploration of the transferred scope.",
+		);
+	}
 	if (options.includeRefineExamples ?? true) {
 		lines.push("Persist genuinely reusable delegation patterns with `await refine.run()`.");
 	}

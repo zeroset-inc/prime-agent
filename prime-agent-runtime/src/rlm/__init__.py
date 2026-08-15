@@ -30,6 +30,7 @@ class RLMSpawnHandle:
     name: str
     session_dir: Path
     model: str
+    task_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class RLMSubagent:
     session_name: str
     session_dir: Path
     status: str
+    task_id: str | None = None
 
 
 def _install_control_comm_handlers() -> None:
@@ -71,13 +73,17 @@ def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
     name = payload.get("name")
     session_dir = payload.get("session_dir")
     model = payload.get("model")
+    task_id = payload.get("task_id")
     if not all(isinstance(value, str) and value for value in (child_id, name, session_dir, model)):
         raise RuntimeError("rlm.run returned an invalid spawn handle")
+    if task_id is not None and (not isinstance(task_id, str) or not task_id):
+        raise RuntimeError("rlm.run returned an invalid task id")
     return RLMSpawnHandle(
         rlm_child_id=child_id,
         name=name,
         session_dir=Path(session_dir),
         model=model,
+        task_id=task_id,
     )
 
 
@@ -151,6 +157,106 @@ async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
     return _spawn_handle_from_payload(payload)
 
 
+async def delegate(prompt: str, task: dict[str, Any], **kwargs: Any) -> RLMSpawnHandle:
+    """Atomically transfer a narrower task to a new recursive child.
+
+    The parent must own every exclusive claim in ``task``. Prime persists the
+    task, binds it to the new child, and rolls the transfer back if startup
+    fails. The child receives the inherited context envelope automatically.
+    """
+    if not isinstance(prompt, str):
+        raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
+    if not isinstance(task, dict):
+        raise TypeError(f"task must be dict, got {type(task).__name__}")
+    payload = await host_request(
+        "rlm.delegate",
+        {"prompt": prompt, "task": task, "kwargs": kwargs},
+    )
+    return _spawn_handle_from_payload(payload)
+
+
+class _RLMTaskAPI:
+    async def current(self) -> dict[str, Any]:
+        """Return this agent's task and complete inherited context envelope."""
+        return await host_request("rlm.task.current")
+
+    async def snapshot(self, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        """Return tree-wide ownership plus generic supervision alerts."""
+        if not isinstance(offset, int):
+            raise TypeError(f"offset must be int, got {type(offset).__name__}")
+        if not isinstance(limit, int):
+            raise TypeError(f"limit must be int, got {type(limit).__name__}")
+        return await host_request("rlm.task.snapshot", {"offset": offset, "limit": limit})
+
+    async def update(
+        self,
+        summary: str,
+        *,
+        evidence_refs: list[str] | None = None,
+        completed_questions: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Persist bounded progress and evidence references for the current task."""
+        payload: dict[str, Any] = {"summary": summary}
+        if evidence_refs is not None:
+            payload["evidence_refs"] = evidence_refs
+        if completed_questions is not None:
+            payload["completed_questions"] = completed_questions
+        return await host_request("rlm.task.update", payload)
+
+    async def complete(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Complete the current task with a bounded structured result."""
+        if not isinstance(result, dict):
+            raise TypeError(f"result must be dict, got {type(result).__name__}")
+        return await host_request("rlm.task.complete", {"result": result})
+
+    async def report_gap(
+        self,
+        kind: str,
+        description: str,
+        *,
+        needed_information: str | None = None,
+        evidence_refs: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Report missing coverage, context, or a dependency to the direct parent."""
+        payload: dict[str, Any] = {"kind": kind, "description": description}
+        if needed_information is not None:
+            payload["needed_information"] = needed_information
+        if evidence_refs is not None:
+            payload["evidence_refs"] = evidence_refs
+        return await host_request("rlm.task.report_gap", payload)
+
+    async def resolve_gap(
+        self,
+        task_id: str,
+        gap_id: str,
+        resolution: str,
+        *,
+        status: str = "resolved",
+        evidence_refs: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve or decline a directly supervised task gap."""
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "gap_id": gap_id,
+            "status": status,
+            "resolution": resolution,
+        }
+        if evidence_refs is not None:
+            payload["evidence_refs"] = evidence_refs
+        return await host_request("rlm.task.resolve_gap", payload)
+
+    async def cancel(self, task_id: str, reason: str) -> dict[str, Any]:
+        """Cancel a directly supervised task; the root may cancel any descendant."""
+        return await host_request("rlm.task.cancel", {"task_id": task_id, "reason": reason})
+
+    async def reassign(self, task_id: str, owner_agent_id: str) -> dict[str, Any]:
+        """Reassign a directly supervised task; the root may reassign any descendant."""
+        return await host_request(
+            "rlm.task.reassign",
+            {"task_id": task_id, "owner_agent_id": owner_agent_id},
+        )
+
+
 def _model_from_payload(payload: Any) -> RLMModel:
     if not isinstance(payload, dict):
         raise RuntimeError("rlm.find_models returned an invalid model entry")
@@ -185,6 +291,7 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
     session_name = payload.get("session_name")
     session_dir = payload.get("session_dir")
     status = payload.get("status")
+    task_id = payload.get("task_id")
     if not isinstance(child_id, str) or not child_id:
         raise RuntimeError(f"{operation} entry is missing rlm_child_id")
     if active_session_id is not None and not isinstance(active_session_id, str):
@@ -197,6 +304,8 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
         raise RuntimeError(f"{operation} entry is missing session_dir")
     if status not in {"running", "completed", "error"}:
         raise RuntimeError(f"{operation} entry has invalid status")
+    if task_id is not None and (not isinstance(task_id, str) or not task_id):
+        raise RuntimeError(f"{operation} entry has invalid task_id")
     return RLMSubagent(
         rlm_child_id=child_id,
         active_session_id=active_session_id,
@@ -204,6 +313,7 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
         session_name=session_name,
         session_dir=Path(session_dir),
         status=status,
+        task_id=task_id,
     )
 
 
@@ -284,9 +394,13 @@ _harness_state = _HarnessProxy()
 class _RLMCallable:
     harness = _harness_state
     get_harness_state = staticmethod(get_harness_state)
+    task = _RLMTaskAPI()
 
     async def run(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
         return await run(prompt, **kwargs)
+
+    async def delegate(self, prompt: str, task: dict[str, Any], **kwargs: Any) -> RLMSpawnHandle:
+        return await delegate(prompt, task, **kwargs)
 
     async def find_models(self, query: str = "", limit: int = 8) -> list[RLMModel]:
         return await find_models(query, limit)
@@ -324,6 +438,7 @@ __all__ = [
     "RLMSubagent",
     "RefinementEvent",
     "delete_subagent",
+    "delegate",
     "find_models",
     "get_harness_state",
     "harness",
