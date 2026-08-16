@@ -766,6 +766,151 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("wakes a nested task owner exactly once after its final gap is resolved", async () => {
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "gap-resume-coordination"),
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "a.ts" },
+					{ namespace: "repo:file", key: "b.ts" },
+					{ namespace: "repo:file", key: "c.ts" },
+				],
+			},
+			policy: { requireExclusiveClaims: true },
+		});
+		const childTask = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review runtime files",
+				scope: "a.ts and b.ts",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "a.ts" },
+					{ namespace: "repo:file", key: "b.ts" },
+				],
+				delegationReason: "Independent runtime boundary",
+			},
+		});
+		graph.startTask(childTask.id, "child-agent");
+		const grandchildTask = graph.reserveDelegation({
+			parentTaskId: childTask.id,
+			callerAgentId: "child-agent",
+			childAgentId: "grandchild-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [{ namespace: "repo:file", key: "a.ts" }],
+				delegationReason: "Focused contract",
+			},
+		});
+		graph.startTask(grandchildTask.id, "grandchild-agent");
+		const gap = graph.reportGap(grandchildTask.id, "grandchild-agent", {
+			kind: "context",
+			description: "Need the generated contract",
+		});
+
+		const root = createSession({ taskGraph: graph, taskId: graph.rootTaskId, maxDepth: 3 });
+		const child = createSession({
+			taskGraph: graph,
+			taskId: childTask.id,
+			depth: 1,
+			maxDepth: 3,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "gap-resume-child")),
+		});
+		const grandchild = createSession({
+			taskGraph: graph,
+			taskId: grandchildTask.id,
+			depth: 2,
+			maxDepth: 3,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "gap-resume-grandchild")),
+		});
+		root.registerRlmChildSession("child-agent", child);
+		child.registerRlmChildSession("grandchild-agent", grandchild);
+
+		const rootHandlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
+		await expect(
+			rootHandlers["rlm.task.resolve_gap"]?.({
+				task_id: grandchildTask.id,
+				gap_id: gap.id,
+				status: "resolved",
+				resolution: "Generated contract is artifact://contract",
+				evidence_refs: ["artifact://contract"],
+			}),
+		).resolves.toMatchObject({ resumeDelivery: "admitted" });
+		await waitFor(
+			() =>
+				grandchild.messages.filter(
+					(message) => message.role === "custom" && message.customType === "agent_task_resume",
+				).length === 1,
+		);
+		const task = graph.getTask(grandchildTask.id);
+		expect(task).toMatchObject({ status: "running", resumeRequest: { status: "admitted" } });
+		const request = {
+			...task.resumeRequest!,
+			gaps: task.gaps,
+			context: graph.contextEnvelope(task.id),
+		};
+		await expect(grandchild.admitTaskResume(request)).resolves.toBe("admitted");
+		expect(
+			grandchild.messages.filter(
+				(message) => message.role === "custom" && message.customType === "agent_task_resume",
+			),
+		).toHaveLength(1);
+		await root.disposeAsync();
+	});
+
+	it("keeps a resolved task pending when its owner runtime is unavailable", async () => {
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "gap-resume-owner-unavailable"),
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "a.ts" },
+					{ namespace: "repo:file", key: "b.ts" },
+				],
+			},
+			policy: { requireExclusiveClaims: true },
+		});
+		const childTask = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "missing-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [{ namespace: "repo:file", key: "a.ts" }],
+				delegationReason: "Focused contract",
+			},
+		});
+		graph.startTask(childTask.id, "missing-agent");
+		const gap = graph.reportGap(childTask.id, "missing-agent", {
+			kind: "context",
+			description: "Need generated context",
+		});
+		const root = createSession({ taskGraph: graph, taskId: graph.rootTaskId });
+		const rootHandlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
+
+		await expect(
+			rootHandlers["rlm.task.resolve_gap"]?.({
+				task_id: childTask.id,
+				gap_id: gap.id,
+				status: "resolved",
+				resolution: "Context recovered",
+			}),
+		).resolves.toMatchObject({ resumeDelivery: "owner_unavailable" });
+		expect(graph.getTask(childTask.id)).toMatchObject({
+			status: "pending",
+			resumeRequest: { status: "pending", ownerAgentId: "missing-agent" },
+		});
+		expect(graph.getSupervisionAlerts()).toContainEqual(
+			expect.objectContaining({ taskId: childTask.id, kind: "resume_pending" }),
+		);
+	});
+
 	it("atomically replaces a task runtime and revokes the previous session actor", async () => {
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "replacement-sessions"));
 		const graph = AgentTaskGraph.open({
