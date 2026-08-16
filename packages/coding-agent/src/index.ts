@@ -175,8 +175,20 @@ export {
 	// Tool factories (for custom cwd)
 	createEditTool,
 	createIpythonTool,
+	createPolicyControlledSubagentRuntimeHost,
+	PolicyControlledSubagentRuntimeHost,
+	type PolicyControlledSubagentRuntimeHostOptions,
 	type PromptTemplate,
+	type RlmSubagentAdmissionDecision,
+	RlmSubagentAdmissionError,
+	type RlmSubagentAdmissionPolicy,
+	type RlmSubagentAdmissionRequest,
+	RlmSubagentCapacityPool,
+	type RlmSubagentPolicyEntry,
+	type RlmSubagentPolicySnapshot,
+	type RlmSubagentPolicyStatus,
 	type RlmSubagentRuntime,
+	type RlmSubagentRuntimeOverrides,
 	type SubagentRuntimeHost,
 } from "./core/sdk.js";
 export type { SessionActionSnapshot } from "./core/session-action-store.js";
@@ -233,6 +245,7 @@ export {
 	type SkillPythonMetadata,
 } from "./core/skills.js";
 export { createSyntheticSourceInfo } from "./core/source-info.js";
+export * from "./core/task-graph.js";
 // Tools
 export {
 	type BashOperations,

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-08-16
+
+- Changed recursive execution capacity to apply to every active child turn—including retained follow-ups, retries, and post-compaction continuations—without consuming capacity while a child is idle.
+- Added atomic task-runtime replacement with immutable actor identities, bounded inherited context with on-demand root-context resolution, compact usage journals, explicit checkpoints, and graph health diagnostics.
+- Fixed recovery interrupting only starting/running children, failing to persist root-agent rebinding, and reclaiming sibling task claims from stale state.
+- Fixed successful children being marked interrupted when their unstructured conclusion exceeded the structured task-result summary limit.
+- Fixed usage-accounting failures disabling task orchestration, and made task-graph durability failures independently observable.
+- Changed the release packer to reject package or requested-version drift from checked-in source metadata.
 - Fixed fullscreen wheel scrolling in Ghostty while retaining application link clicks; set `terminal.fullscreenMouse` to `false` to use native Cmd-click instead.
 - Changed the agents view to sort idle and inactive sessions by last message time, newest first, while keeping running agents in stable creation order.
 - Fixed `openai-codex` models being invisible to `rlm` subagents and `find_models` because model discovery reported Prime Agent's own version as the Codex client version ([#1375](https://github.com/PrimeIntellect-ai/prime-agent/pull/1375) by [@bilelrais](https://github.com/bilelrais)).
@@ -9,6 +17,11 @@
 - Restored bare `prime-agent --resume` opening the agents view and the `/resume [id|path]` slash command; bare commands open the agents view and an argument resumes that session in place.
 - Fixed URLs not opening on click in fullscreen mode on terminals such as Ghostty; clicking a link in the transcript, dock, or overlays now opens it in the browser.
 - Fixed ctrl+p ("Toggle agent message expansion") only toggling received agent messages; it now expands and collapses sent agent messages together with received ones.
+
+## [0.7.3] - 2026-08-15
+
+- Added an SDK host decorator for embedding-owned RLM subagent admission, runtime overrides, and lifecycle accounting.
+- Added a durable run-scoped task graph with exclusive ownership transfer, atomic recursive delegation, inherited context, recovery, supervision alerts, gaps, evidence references, per-task usage, and shared FIFO child capacity without a total-child cap.
 
 ## [0.7.2] - 2026-08-11
 

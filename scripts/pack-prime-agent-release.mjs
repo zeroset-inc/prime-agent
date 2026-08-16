@@ -156,6 +156,9 @@ function npmTarballName(packageName, version) {
 }
 
 function releaseTarballUrl(baseUrl, version, tarballFile) {
+	if (baseUrl.endsWith("/releases/download")) {
+		return `${baseUrl}/v${version}/${tarballFile}`;
+	}
 	return `${baseUrl}/releases/v${version}/${tarballFile}`;
 }
 
@@ -237,14 +240,34 @@ function sha256File(path) {
 
 function main() {
 	const args = parseArgs(process.argv.slice(2));
+	const workspaceVersion = normalizeVersion(readJson(join(root, "package.json")).version);
 	const sourcePackages = new Map(
 		releasePackages.map((releasePackage) => [
 			releasePackage.packageDir,
 			readJson(packageJsonPath(releasePackage.packageDir)),
 		]),
 	);
-	const cliPackage = sourcePackages.get("coding-agent");
-	const releaseVersion = args.version || normalizeVersion(process.env.PRIME_AGENT_VERSION || cliPackage.version);
+	const sourceVersions = new Map(
+		[...sourcePackages.entries()].map(([packageDir, sourcePackage]) => [
+			packageDir,
+			normalizeVersion(sourcePackage.version),
+		]),
+	);
+	const mismatchedSource = [...sourceVersions.entries()].filter(([, version]) => version !== workspaceVersion);
+	if (mismatchedSource.length > 0) {
+		throw new Error(
+			`Release package versions must match workspace version ${workspaceVersion}: ${mismatchedSource
+				.map(([packageDir, version]) => `${packageDir}=${version}`)
+				.join(", ")}`,
+		);
+	}
+	const requestedVersion = normalizeVersion(args.version || process.env.PRIME_AGENT_VERSION || workspaceVersion);
+	if (requestedVersion !== workspaceVersion) {
+		throw new Error(
+			`Requested release version ${requestedVersion} must match source package version ${workspaceVersion}`,
+		);
+	}
+	const releaseVersion = workspaceVersion;
 
 	for (const releasePackage of releasePackages) {
 		requireBuiltPackage(releasePackage.packageDir);

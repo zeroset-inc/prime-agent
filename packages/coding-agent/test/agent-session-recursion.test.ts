@@ -35,6 +35,7 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager, type SettingsStorage } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
+import { AgentTaskGraph } from "../src/core/task-graph.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
@@ -258,6 +259,8 @@ describe("AgentSession rlm recursion", () => {
 			sessionManager?: SessionManager;
 			settingsManager?: SettingsManager;
 			extensionsResult?: LoadExtensionsResult;
+			taskGraph?: AgentTaskGraph;
+			taskId?: string;
 		} = {},
 	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
@@ -310,6 +313,8 @@ describe("AgentSession rlm recursion", () => {
 			rlmDepth: options.depth,
 			rlmMaxDepth: options.maxDepth,
 			rlmSessionDir: options.rlmSessionDir,
+			taskGraph: options.taskGraph,
+			taskId: options.taskId,
 		});
 		return session;
 	}
@@ -717,6 +722,97 @@ describe("AgentSession rlm recursion", () => {
 		// Context tokens from the child's own assistant usage (input 7 + output 3); no tools ran.
 		expect(doneUpdate?.tokenCount).toBe(10);
 		expect(doneUpdate?.toolUseCount).toBeUndefined();
+	});
+
+	it("atomically delegates a durable task and gives the child its inherited context envelope", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "coordinated-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+				rootContext: { baseRevision: "base", headRevision: "head" },
+			},
+			policy: { requireExclusiveClaims: true },
+		});
+		const root = createSession({ sessionManager, maxDepth: 2, taskGraph: graph, taskId: graph.rootTaskId });
+
+		const spawned = await root.delegateRlmChild("Complete the assigned runtime review", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			questions: ["Does runtime behavior remain compatible?"],
+			delegationReason: "Independent runtime boundary",
+		});
+
+		expect(spawned.task_id).toBeDefined();
+		expect(graph.getTask(graph.rootTaskId).exclusiveClaims).toEqual([
+			{ namespace: "repo:file", key: "installer.ts" },
+		]);
+		await waitFor(() => graph.getTask(spawned.task_id!).status === "completed");
+		const child = root.getRlmChildSession(spawned.rlm_child_id);
+		expect(child?.taskId).toBe(spawned.task_id);
+		expect(child?.messages[0]).toMatchObject({
+			role: "custom",
+			content: expect.stringContaining('"baseRevision": "base"'),
+		});
+		const handlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
+		await expect(handlers["rlm.task.current"]?.({})).resolves.toMatchObject({
+			task: { id: spawned.task_id, status: "completed" },
+		});
+	});
+
+	it("atomically replaces a task runtime and revokes the previous session actor", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "replacement-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "replacement-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: { requireExclusiveClaims: true },
+		});
+		let firstTurnStarted = false;
+		const root = createSession({
+			sessionManager,
+			maxDepth: 2,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+			streamFn: (_model, context) => {
+				if (userText(context).includes("first runtime")) {
+					firstTurnStarted = true;
+					return createAssistantMessageEventStream();
+				}
+				return streamAnswer("replacement complete");
+			},
+		});
+
+		const original = await root.delegateRlmChild("first runtime", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			delegationReason: "Independent runtime boundary",
+		});
+		await waitFor(() => firstTurnStarted);
+		const originalSession = root.getRlmChildSession(original.rlm_child_id);
+		if (!originalSession || !original.task_id) throw new Error("Missing original coordinated child");
+		const originalHandlers = (originalSession as unknown as InspectableRlmSession)._createKernelHostHandlers();
+
+		const replacement = await root.replaceRlmTask(original.task_id, "replacement runtime");
+		expect(replacement.task_id).toBe(original.task_id);
+		expect(graph.getTask(original.task_id).ownerAgentId).toBe(replacement.rlm_child_id);
+		await expect(originalHandlers["rlm.task.update"]?.({ summary: "stale actor still working" })).rejects.toThrow(
+			"does not own task",
+		);
+		await waitFor(() => graph.getTask(original.task_id!).status === "completed");
 	});
 
 	it("marks an in-cell roled send to the parent as replied", async () => {

@@ -99,8 +99,27 @@ export type {
 	ToolDefinition,
 } from "./extensions/index.js";
 export type { PromptTemplate } from "./prompt-templates.js";
-export type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
+export type {
+	CreateRlmSubagentRuntimeOptions,
+	PolicyControlledSubagentRuntimeHostOptions,
+	RlmSubagentAdmissionDecision,
+	RlmSubagentAdmissionPolicy,
+	RlmSubagentAdmissionRequest,
+	RlmSubagentPolicyEntry,
+	RlmSubagentPolicySnapshot,
+	RlmSubagentPolicyStatus,
+	RlmSubagentRuntime,
+	RlmSubagentRuntimeOverrides,
+	SubagentRuntimeHost,
+} from "./rlm-runtime.js";
+export {
+	createPolicyControlledSubagentRuntimeHost,
+	PolicyControlledSubagentRuntimeHost,
+	RlmSubagentAdmissionError,
+	RlmSubagentCapacityPool,
+} from "./rlm-runtime.js";
 export type { Skill } from "./skills.js";
+export * from "./task-graph.js";
 export type { Tool } from "./tools/index.js";
 
 export {
@@ -392,6 +411,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
 		rlmParentAgent: options.rlmParentAgent,
+		taskGraph: options.taskGraph,
+		taskId: options.taskId,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,
