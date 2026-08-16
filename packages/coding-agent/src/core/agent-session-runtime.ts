@@ -17,6 +17,7 @@ import { assertSessionCwdExists } from "./session-cwd.js";
 import { SessionImportFileNotFoundError } from "./session-import-errors.js";
 import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "./session-lease.js";
 import { SessionManager } from "./session-manager.js";
+import type { AgentTaskResumeDispatch } from "./task-graph.js";
 
 export { SessionImportFileNotFoundError } from "./session-import-errors.js";
 
@@ -396,6 +397,18 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			throw error;
 		}
 		return runtime;
+	}
+
+	async resumeTaskOwner(request: AgentTaskResumeDispatch): Promise<"admitted" | "owner_unavailable"> {
+		for (const runtime of this.subagentRuntimes.values()) {
+			if (runtime.metadata.taskId === request.taskId) {
+				const direct = await runtime.session.admitTaskResume(request);
+				if (direct === "admitted") return direct;
+			}
+			const nested = await runtime.resumeTaskOwner(request);
+			if (nested === "admitted") return nested;
+		}
+		return "owner_unavailable";
 	}
 
 	async deleteRlmSubagentRuntime(childId: string, session: AgentSession): Promise<void> {

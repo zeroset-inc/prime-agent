@@ -90,6 +90,22 @@ export interface AgentTaskGap {
 	updatedAt: string;
 }
 
+export interface AgentTaskResumeRequest {
+	id: string;
+	taskId: string;
+	ownerAgentId: string;
+	gapIds: string[];
+	gapCount: number;
+	status: "pending" | "admitted";
+	requestedAt: string;
+	admittedAt?: string;
+}
+
+export interface AgentTaskResumeDispatch extends AgentTaskResumeRequest {
+	gaps: AgentTaskGap[];
+	context: AgentTaskContextEnvelope;
+}
+
 export interface AgentTaskUsage {
 	input: number;
 	output: number;
@@ -120,6 +136,7 @@ export interface AgentTask {
 	progress?: AgentTaskProgress;
 	result?: AgentTaskResult;
 	gaps: AgentTaskGap[];
+	resumeRequest?: AgentTaskResumeRequest;
 	usage: AgentTaskUsage;
 	childAgentId?: string;
 	reclaimedAt?: string;
@@ -152,7 +169,7 @@ export interface AgentTaskGraphPage {
 export interface AgentTaskSupervisionAlert {
 	taskId: string;
 	ownerAgentId: string;
-	kind: "blocked_gap" | "stalled" | "ready_for_synthesis" | "reported_uncertainty";
+	kind: "blocked_gap" | "resume_pending" | "stalled" | "ready_for_synthesis" | "reported_uncertainty";
 	message: string;
 	directParentTaskId?: string;
 	ageMs?: number;
@@ -289,8 +306,17 @@ export class AgentTaskGraph {
 	rebindRootAgent(ownerAgentId: string): AgentTask {
 		const normalizedOwner = normalizeIdentifier(ownerAgentId, "ownerAgentId");
 		const root = this.findTask(this.state.rootTaskId);
-		if (this.state.rootAgentId === normalizedOwner && root.ownerAgentId === normalizedOwner) return clone(root);
-		const next = touchTask({ ...root, ownerAgentId: normalizedOwner });
+		if (
+			this.state.rootAgentId === normalizedOwner &&
+			root.ownerAgentId === normalizedOwner &&
+			(!root.resumeRequest || root.resumeRequest.ownerAgentId === normalizedOwner)
+		)
+			return clone(root);
+		const next = touchTask({
+			...root,
+			ownerAgentId: normalizedOwner,
+			...(root.resumeRequest ? { resumeRequest: { ...root.resumeRequest, ownerAgentId: normalizedOwner } } : {}),
+		});
 		this.commit("graph.root_rebound", normalizedOwner, [next], { rootAgentId: normalizedOwner });
 		return clone(next);
 	}
@@ -339,6 +365,15 @@ export class AgentTaskGraph {
 		const alerts: AgentTaskSupervisionAlert[] = [];
 		for (const task of this.state.tasks) {
 			const parent = task.parentTaskId ? this.findTask(task.parentTaskId) : undefined;
+			if (task.status === "pending" && task.resumeRequest?.status === "pending") {
+				alerts.push({
+					taskId: task.id,
+					ownerAgentId: task.ownerAgentId,
+					kind: "resume_pending",
+					message: "Resolved task gap is waiting for its owner runtime to admit a follow-up turn",
+					...(parent ? { directParentTaskId: parent.id } : {}),
+				});
+			}
 			for (const gap of task.gaps.filter((candidate) => candidate.status === "open")) {
 				alerts.push({
 					taskId: task.id,
@@ -424,6 +459,21 @@ export class AgentTaskGraph {
 
 	getRootContext(): Record<string, unknown> | undefined {
 		return this.state.rootContext ? clone(this.state.rootContext) : undefined;
+	}
+
+	getPendingResumeRequests(): AgentTaskResumeDispatch[] {
+		return this.state.tasks.flatMap((task) => {
+			const request = task.resumeRequest;
+			if (task.status !== "pending" || request?.status !== "pending") return [];
+			return [
+				{
+					...clone(request),
+					ownerAgentId: task.ownerAgentId,
+					gaps: clone(task.gaps.filter((gap) => request.gapIds.includes(gap.id))),
+					context: this.contextEnvelope(task.id),
+				},
+			];
+		});
 	}
 
 	reserveDelegation(input: {
@@ -532,8 +582,44 @@ export class AgentTaskGraph {
 		if (task.status !== "pending" && task.status !== "starting") {
 			throw new AgentTaskGraphError(`task ${taskId} cannot start from status ${task.status}`);
 		}
-		const next = touchTask({ ...task, status: "running" });
+		const next = touchTask({
+			...task,
+			status: "running",
+			...(task.resumeRequest?.status === "pending"
+				? {
+						resumeRequest: {
+							...task.resumeRequest,
+							status: "admitted" as const,
+							admittedAt: new Date().toISOString(),
+						},
+					}
+				: {}),
+		});
 		this.commit("task.started", callerAgentId, [next]);
+		return clone(next);
+	}
+
+	markResumeAdmitted(taskId: string, requestId: string, callerAgentId: string): AgentTask {
+		const task = this.findTask(taskId);
+		this.assertOwner(task, callerAgentId);
+		const request = task.resumeRequest;
+		if (!request || request.id !== requestId) {
+			throw new AgentTaskGraphError(`unknown resume request ${requestId} for task ${taskId}`);
+		}
+		if (request.status === "admitted") return clone(task);
+		if (task.status !== "pending") {
+			throw new AgentTaskGraphError(`task ${taskId} cannot admit a resume from status ${task.status}`);
+		}
+		const next = touchTask({
+			...task,
+			status: "running",
+			resumeRequest: {
+				...request,
+				status: "admitted",
+				admittedAt: new Date().toISOString(),
+			},
+		});
+		this.commit("task.resume_admitted", callerAgentId, [next]);
 		return clone(next);
 	}
 
@@ -616,9 +702,27 @@ export class AgentTaskGraph {
 		};
 		const gaps = [...task.gaps];
 		gaps[index] = nextGap;
-		const status =
-			task.status === "blocked" && gaps.every((candidate) => candidate.status !== "open") ? "running" : task.status;
-		const next = touchTask({ ...task, status, gaps });
+		const becomesRunnable = task.status === "blocked" && gaps.every((candidate) => candidate.status !== "open");
+		const requestedAt = new Date().toISOString();
+		const cycleStart = task.resumeRequest?.gapCount ?? 0;
+		const next = touchTask({
+			...task,
+			status: becomesRunnable ? "pending" : task.status,
+			gaps,
+			...(becomesRunnable
+				? {
+						resumeRequest: {
+							id: `resume-${nextGap.id}`,
+							taskId: task.id,
+							ownerAgentId: task.ownerAgentId,
+							gapIds: gaps.slice(cycleStart).map((candidate) => candidate.id),
+							gapCount: gaps.length,
+							status: "pending" as const,
+							requestedAt,
+						},
+					}
+				: {}),
+		});
 		this.commit("task.gap_resolved", callerAgentId, [next]);
 		return clone(nextGap);
 	}
@@ -688,10 +792,12 @@ export class AgentTaskGraph {
 		const task = this.findTask(taskId);
 		this.assertCanSupervise(task, callerAgentId);
 		this.assertActive(task, "reassign");
+		const ownerAgentId = normalizeIdentifier(newOwnerAgentId, "newOwnerAgentId");
 		const next = touchTask({
 			...task,
-			ownerAgentId: normalizeIdentifier(newOwnerAgentId, "newOwnerAgentId"),
-			childAgentId: newOwnerAgentId,
+			ownerAgentId,
+			childAgentId: ownerAgentId,
+			...(task.resumeRequest ? { resumeRequest: { ...task.resumeRequest, ownerAgentId } } : {}),
 		});
 		this.commit("task.reassigned", callerAgentId, [next]);
 		return clone(next);
@@ -787,19 +893,50 @@ export class AgentTaskGraph {
 	private recover(rootAgentId: string): void {
 		const root = this.findTask(this.state.rootTaskId);
 		const rootAgentChanged = this.state.rootAgentId !== rootAgentId;
-		if (root.ownerAgentId !== rootAgentId || root.status !== "running" || rootAgentChanged) {
+		const rootHasPendingResume = root.status === "pending" && root.resumeRequest?.status === "pending";
+		const recoveredRootStatus = rootHasPendingResume ? "pending" : "running";
+		const rootNeedsRecovery =
+			root.ownerAgentId !== rootAgentId ||
+			root.status !== recoveredRootStatus ||
+			(root.resumeRequest !== undefined && root.resumeRequest.ownerAgentId !== rootAgentId);
+		if (rootNeedsRecovery || rootAgentChanged) {
 			this.commit(
 				"graph.recovered",
 				rootAgentId,
-				root.ownerAgentId !== rootAgentId || root.status !== "running"
-					? [touchTask({ ...root, ownerAgentId: rootAgentId, status: "running" })]
+				rootNeedsRecovery
+					? [
+							touchTask({
+								...root,
+								ownerAgentId: rootAgentId,
+								status: recoveredRootStatus,
+								...(root.resumeRequest
+									? { resumeRequest: { ...root.resumeRequest, ownerAgentId: rootAgentId } }
+									: {}),
+							}),
+						]
 					: [],
 				rootAgentChanged ? { rootAgentId } : undefined,
 			);
 		}
+		const preservedTaskIds = new Set<string>();
+		for (const task of this.state.tasks) {
+			if (task.status !== "pending" || task.resumeRequest?.status !== "pending") continue;
+			let current: AgentTask | undefined = task;
+			while (current) {
+				preservedTaskIds.add(current.id);
+				current = current.parentTaskId
+					? this.state.tasks.find((candidate) => candidate.id === current?.parentTaskId)
+					: undefined;
+			}
+		}
 		const activeTaskIds = new Set(
 			this.state.tasks
-				.filter((task) => task.id !== this.state.rootTaskId && ACTIVE_TASK_STATUSES.has(task.status))
+				.filter(
+					(task) =>
+						task.id !== this.state.rootTaskId &&
+						ACTIVE_TASK_STATUSES.has(task.status) &&
+						!preservedTaskIds.has(task.id),
+				)
 				.map((task) => task.id),
 		);
 		const recoveryRoots = this.state.tasks.filter(

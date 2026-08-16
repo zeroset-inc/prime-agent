@@ -375,8 +375,110 @@ describe("AgentTaskGraph", () => {
 			status: "resolved",
 			resolution: "Generated output is artifact://generated",
 		});
+		expect(graph.getTask(child.id).status).toBe("pending");
+		const [resume] = graph.getPendingResumeRequests();
+		expect(resume).toMatchObject({ taskId: child.id, ownerAgentId: "child-agent", gapIds: [gap.id] });
+		graph.markResumeAdmitted(child.id, resume!.id, "child-agent");
 		graph.completeTaskFromRuntime(child.id, "child-agent", "Verified");
 		expect(() => graph.assertDelegatedTasksComplete()).not.toThrow();
+	});
+
+	it("creates one bounded resume epoch for each blocking cycle", () => {
+		const graph = open();
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent file",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		const first = graph.reportGap(child.id, "child-agent", { kind: "context", description: "Need first input" });
+		graph.resolveGap(child.id, first.id, "root-agent", { status: "resolved", resolution: "First input" });
+		const firstResume = graph.getPendingResumeRequests()[0]!;
+		expect(firstResume.gapIds).toEqual([first.id]);
+		graph.markResumeAdmitted(child.id, firstResume.id, "child-agent");
+
+		const second = graph.reportGap(child.id, "child-agent", { kind: "dependency", description: "Need second input" });
+		graph.resolveGap(child.id, second.id, "root-agent", { status: "declined", resolution: "Proceed without it" });
+		const secondResume = graph.getPendingResumeRequests()[0]!;
+		expect(secondResume.id).not.toBe(firstResume.id);
+		expect(secondResume.gapIds).toEqual([second.id]);
+		expect(secondResume.gaps.map((gap) => gap.id)).toEqual([second.id]);
+	});
+
+	it("preserves pending gap resumes across recovery and interrupts unrelated active work", () => {
+		const graph = open();
+		const resumable = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "resume-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent file",
+			},
+		});
+		const unrelated = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "other-agent",
+			task: {
+				objective: "Review b.ts",
+				scope: "b.ts",
+				exclusiveClaims: [claim("b.ts")],
+				delegationReason: "Independent file",
+			},
+		});
+		graph.startTask(resumable.id, "resume-agent");
+		graph.startTask(unrelated.id, "other-agent");
+		const gap = graph.reportGap(resumable.id, "resume-agent", { kind: "context", description: "Need context" });
+		graph.resolveGap(resumable.id, gap.id, "root-agent", { status: "resolved", resolution: "Context found" });
+		graph.checkpoint();
+
+		const restored = AgentTaskGraph.open({
+			directory: directory!,
+			root: { ownerAgentId: "restored-root", objective: "Review the change" },
+			policy: { requireExclusiveClaims: true },
+		});
+		expect(restored.getTask(resumable.id).status).toBe("pending");
+		expect(restored.getPendingResumeRequests()).toHaveLength(1);
+		expect(restored.getTask(unrelated.id).status).toBe("interrupted");
+	});
+
+	it("preserves and retargets a root resume across checkpoint recovery", () => {
+		const graph = open();
+		const gap = graph.reportGap(graph.rootTaskId, "root-agent", {
+			kind: "context",
+			description: "Need deployment context",
+		});
+		graph.resolveGap(graph.rootTaskId, gap.id, "root-agent", {
+			status: "resolved",
+			resolution: "Deployment context found",
+		});
+		graph.checkpoint();
+
+		const restored = AgentTaskGraph.open({
+			directory: directory!,
+			root: { ownerAgentId: "restored-root", objective: "Review the change" },
+			policy: { requireExclusiveClaims: true },
+		});
+		const [resume] = restored.getPendingResumeRequests();
+		expect(restored.getTask(restored.rootTaskId)).toMatchObject({
+			status: "pending",
+			ownerAgentId: "restored-root",
+			resumeRequest: { ownerAgentId: "restored-root", status: "pending" },
+		});
+		expect(resume).toMatchObject({
+			taskId: restored.rootTaskId,
+			ownerAgentId: "restored-root",
+			gapIds: [gap.id],
+		});
 	});
 
 	it("bounds unstructured runtime conclusions without turning success into interruption", () => {
@@ -419,6 +521,33 @@ describe("AgentTaskGraph", () => {
 		expect(graph.updateProgress(child.id, "new-agent", { summary: "Replacement working" }).ownerAgentId).toBe(
 			"new-agent",
 		);
+	});
+
+	it("retargets a pending resume when its task is reassigned", () => {
+		const graph = open();
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "old-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent file",
+			},
+		});
+		graph.startTask(child.id, "old-agent");
+		const gap = graph.reportGap(child.id, "old-agent", { kind: "context", description: "Need context" });
+		graph.resolveGap(child.id, gap.id, "root-agent", { status: "resolved", resolution: "Context found" });
+		graph.reassignTask(child.id, "root-agent", "replacement-agent");
+		const [resume] = graph.getPendingResumeRequests();
+		expect(resume).toMatchObject({ taskId: child.id, ownerAgentId: "replacement-agent" });
+		expect(() => graph.markResumeAdmitted(child.id, resume!.id, "old-agent")).toThrow("does not own task");
+		graph.startTask(child.id, "replacement-agent");
+		expect(graph.getTask(child.id)).toMatchObject({
+			status: "running",
+			resumeRequest: { id: resume!.id, ownerAgentId: "replacement-agent", status: "admitted" },
+		});
 	});
 
 	it("surfaces generic root-visible supervision signals without taking workflow decisions", () => {

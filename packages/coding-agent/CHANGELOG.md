@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-08-17
+
+- Fixed resolved task gaps leaving owners idle by durably scheduling one replay-safe follow-up for root, nested, reassigned, and restored task owners.
+
 ## [0.7.4] - 2026-08-16
 
 - Changed recursive execution capacity to apply to every active child turn—including retained follow-ups, retries, and post-compaction continuations—without consuming capacity while a child is idle.

@@ -21,6 +21,7 @@ import {
 } from "../src/core/rlm-runtime.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../src/core/session-manager.js";
+import type { AgentTaskResumeDispatch } from "../src/core/task-graph.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
 	AgentDaemon,
@@ -5573,6 +5574,34 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("hydrates a passive task owner before delivering a restored resume", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-task-resume-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir, { childTaskId: "task-passive" });
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				resumeTaskOwner(request: AgentTaskResumeDispatch): Promise<"admitted" | "owner_unavailable">;
+			};
+			await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const request = {
+				id: "resume-gap-1",
+				taskId: "task-passive",
+				ownerAgentId: fixture.childId,
+			} as AgentTaskResumeDispatch;
+
+			await expect(internals.resumeTaskOwner(request)).resolves.toBe("admitted");
+			expect(fixture.createRuntime).toHaveBeenCalledTimes(2);
+			expect(fixture.createRuntime.mock.calls[1]?.[0]).toMatchObject({
+				sessionOptions: { taskId: "task-passive" },
+				runtimeMetadata: { taskId: "task-passive", rlmChildId: fixture.childId },
+			});
+			expect(fixture.runtimeSessions[1]?.admitTaskResume).toHaveBeenCalledOnce();
+			expect(fixture.runtimeSessions[1]?.admitTaskResume).toHaveBeenCalledWith(request);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("rehydrates a legacy child with depth inferred from its session file path", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-legacy-rlm-depth-"));
 		try {
@@ -9678,6 +9707,7 @@ function makePersistedRlmDaemonFixture(
 		childDisposeGate?: Promise<void>;
 		childAdmissionStarted?: () => void;
 		childAdmissionGate?: Promise<void>;
+		childTaskId?: string;
 	} = {},
 ) {
 	const sessionDir = join(tempDir, "sessions");
@@ -9746,6 +9776,7 @@ function makePersistedRlmDaemonFixture(
 			rlmDepth: 1,
 			rlmMaxDepth: 4,
 			rlmParentNodeId: childId,
+			...(options.childTaskId ? { taskId: options.childTaskId } : {}),
 			status: "completed",
 			createdAt: 1,
 			updatedAt: "2026-01-01T00:00:00.000Z",
@@ -9799,6 +9830,7 @@ function makePersistedRlmDaemonFixture(
 			getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
 			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 			acceptAgentMessagePrompt,
+			admitTaskResume: vi.fn(async () => "admitted" as const),
 		});
 		return {
 			session: runtimeSession,

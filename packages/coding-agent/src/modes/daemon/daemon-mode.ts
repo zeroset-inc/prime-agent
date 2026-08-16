@@ -117,6 +117,7 @@ import {
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import type { AgentTaskResumeDispatch } from "../../core/task-graph.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -386,6 +387,7 @@ interface PersistedRlmSubagentRegistryEntry {
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
 	rlmParentNodeId?: string;
+	taskId?: string;
 	prompt?: string;
 	spawnCode?: string;
 	model?: { provider: string; modelId: string };
@@ -924,6 +926,7 @@ export class AgentDaemon {
 			rlmDepth: number;
 			rlmMaxDepth: number;
 			rlmParentNodeId?: string;
+			taskId?: string;
 			prompt?: string;
 			spawnCode?: string;
 			model?: { provider: string; modelId: string };
@@ -943,6 +946,7 @@ export class AgentDaemon {
 			rlmDepth: input.rlmDepth,
 			rlmMaxDepth: input.rlmMaxDepth,
 			...(input.rlmParentNodeId ? { rlmParentNodeId: input.rlmParentNodeId } : {}),
+			...(input.taskId ? { taskId: input.taskId } : {}),
 			...(input.prompt ? { prompt: input.prompt } : {}),
 			...(input.spawnCode ? { spawnCode: input.spawnCode } : {}),
 			...(input.model ? { model: input.model } : {}),
@@ -1016,7 +1020,9 @@ export class AgentDaemon {
 					typeof entry.sessionFile !== "string" ||
 					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
 					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
-					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
+					(entry.rlmMaxDepth !== undefined &&
+						(!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0)) ||
+					(entry.taskId !== undefined && typeof entry.taskId !== "string")
 				) {
 					continue;
 				}
@@ -2208,9 +2214,32 @@ export class AgentDaemon {
 		return passive ? this.hydratePassiveRlmSubagent(passive) : this.getOrHydrateBoundSessionState(selector);
 	}
 
+	private async resumeTaskOwner(request: AgentTaskResumeDispatch): Promise<"admitted" | "owner_unavailable"> {
+		let state = [...this.sessions.values()].find(
+			(candidate) =>
+				candidate.runtime.metadata.kind === "subagent" &&
+				candidate.runtime.metadata.taskId === request.taskId &&
+				candidate.runtime.session.taskActorId === request.ownerAgentId,
+		);
+		if (!state) {
+			const passive = (await this.listPassiveRlmSubagents()).find(
+				(candidate) =>
+					candidate.entry.taskId === request.taskId && candidate.entry.childId === request.ownerAgentId,
+			);
+			if (!passive) return "owner_unavailable";
+			try {
+				state = await this.hydratePassiveRlmSubagent(passive);
+			} catch {
+				return "owner_unavailable";
+			}
+		}
+		return state.runtime.session.admitTaskResume(request);
+	}
+
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
 		return {
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
+			resumeTaskOwner: async (request) => this.resumeTaskOwner(request),
 			completeRlmSubagentRuntime: (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
@@ -2231,6 +2260,7 @@ export class AgentDaemon {
 					rlmDepth: session.rlmDepth,
 					rlmMaxDepth: session.rlmMaxDepth,
 					rlmParentNodeId: metadata.rlmParentNodeId,
+					taskId: metadata.taskId,
 					prompt: metadata.prompt && metadata.prompt.length <= 4096 ? metadata.prompt : undefined,
 					spawnCode: metadata.spawnCode,
 					...(model ? { model: { provider: model.provider, modelId: model.id } } : {}),
@@ -2362,6 +2392,8 @@ export class AgentDaemon {
 					rlmSessionDir: options.sessionDir,
 					rlmParentNodeId: options.rlmParentNodeId,
 					rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
+					taskGraph: options.parentSession.taskGraph,
+					taskId: options.taskId,
 				},
 				runtimeMetadata: {
 					kind: "subagent",
@@ -2371,6 +2403,7 @@ export class AgentDaemon {
 					parentSessionFile: options.parentSession.sessionFile,
 					rlmChildId: options.id,
 					rlmParentNodeId: options.rlmParentNodeId,
+					taskId: options.taskId,
 					prompt: options.prompt,
 					spawnCode: options.spawnCode,
 					sessionDir: options.sessionDir,
@@ -2398,6 +2431,7 @@ export class AgentDaemon {
 						rlmDepth: options.rlmDepth,
 						rlmMaxDepth: options.rlmMaxDepth,
 						rlmParentNodeId: options.rlmParentNodeId,
+						taskId: options.taskId,
 						prompt: options.prompt.length <= 4096 ? options.prompt : undefined,
 						spawnCode: options.spawnCode,
 						model: {
@@ -2758,6 +2792,8 @@ export class AgentDaemon {
 								: 1),
 						rlmMaxDepth: entry.rlmMaxDepth,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
+						taskGraph: parentState.runtime.session.taskGraph,
+						taskId: entry.taskId,
 					},
 					runtimeMetadata: {
 						kind: "subagent",
@@ -2769,6 +2805,7 @@ export class AgentDaemon {
 							: {}),
 						rlmChildId: entry.childId,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
+						taskId: entry.taskId,
 						rehydratedCompleted: true,
 						...(entry.prompt ? { prompt: entry.prompt } : {}),
 						...(entry.spawnCode ? { spawnCode: entry.spawnCode } : {}),

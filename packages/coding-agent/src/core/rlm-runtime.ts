@@ -3,7 +3,7 @@ import type { Api, Model, ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentSession } from "./agent-session.js";
 import type { ToolDefinition } from "./extensions/index.js";
 import type { HostRequestHandler } from "./kernel/index.js";
-import type { AgentTaskDelegationInput } from "./task-graph.js";
+import type { AgentTaskDelegationInput, AgentTaskResumeDispatch } from "./task-graph.js";
 
 export interface RlmRunRequest {
 	prompt: string;
@@ -287,6 +287,8 @@ export interface CreateRlmSubagentRuntimeOptions {
 
 export interface SubagentRuntimeHost {
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
+	/** Admit one durable follow-up for the current owner of a resolved task gap. */
+	resumeTaskOwner?(request: AgentTaskResumeDispatch): Promise<"admitted" | "owner_unavailable">;
 	/** Persist host-owned completion before the child becomes passivation-eligible. */
 	completeRlmSubagentRuntime?(childId: string, session: AgentSession): boolean;
 	/** Release a host-owned child after its detached initial task settles. */
@@ -498,6 +500,10 @@ export class PolicyControlledSubagentRuntimeHost implements SubagentRuntimeHost 
 			}
 			throw error;
 		}
+	}
+
+	async resumeTaskOwner(request: AgentTaskResumeDispatch): Promise<"admitted" | "owner_unavailable"> {
+		return (await this.delegate.resumeTaskOwner?.(request)) ?? "owner_unavailable";
 	}
 
 	completeRlmSubagentRuntime(childId: string, session: AgentSession): boolean {

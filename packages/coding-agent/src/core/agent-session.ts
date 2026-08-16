@@ -276,6 +276,7 @@ import {
 	type AgentTaskDelegationInput,
 	type AgentTaskGraph,
 	type AgentTaskResult,
+	type AgentTaskResumeDispatch,
 	formatAgentTaskContextEnvelope,
 } from "./task-graph.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
@@ -988,6 +989,13 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
+const AGENT_TASK_RESUME_CUSTOM_TYPE = "agent_task_resume";
+
+interface AgentTaskResumeMessageDetails {
+	requestId: string;
+	taskId: string;
+	ownerAgentId: string;
+}
 
 function noopRlmChildAbort(): void {}
 function noopRlmChildEventUnsubscribe(): void {}
@@ -1271,6 +1279,7 @@ export class AgentSession {
 	private readonly _taskActorId?: string;
 	private readonly _turnCapacityPool?: RlmSubagentCapacityPool;
 	private _taskAccountingError?: Error;
+	private _taskResumeDrain?: Promise<void>;
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
@@ -1455,6 +1464,135 @@ export class AgentSession {
 
 	setSubagentRuntimeHost(host?: SubagentRuntimeHost): void {
 		this._subagentRuntimeHost = host;
+		if (this._taskGraph && this._taskId === this._taskGraph.rootTaskId) {
+			// Restored owner discovery is best-effort. An unavailable or broken
+			// runtime leaves the durable request pending for supervision/replay;
+			// it must not become an unhandled startup rejection.
+			void this._drainPendingTaskResumes().catch(() => undefined);
+		}
+	}
+
+	async admitTaskResume(request: AgentTaskResumeDispatch): Promise<"admitted" | "owner_unavailable"> {
+		const graph = this._taskGraph;
+		if (!graph || this._taskId !== request.taskId || this._taskActorId !== request.ownerAgentId) {
+			return "owner_unavailable";
+		}
+		const task = graph.getTask(request.taskId);
+		if (task.ownerAgentId !== request.ownerAgentId || task.resumeRequest?.id !== request.id) {
+			return "owner_unavailable";
+		}
+		if (task.resumeRequest.status === "admitted") return "admitted";
+
+		const queueKey = `task-resume:${request.id}`;
+		const alreadyScheduled = this._actionStore
+			.ownedActions()
+			.some(
+				(action) =>
+					action.queueKey === queueKey &&
+					action.lifecycle.state !== "failed" &&
+					action.lifecycle.state !== "cancelled",
+			);
+		const alreadyDelivered = this.messages.some(
+			(message) =>
+				message.role === "custom" &&
+				message.customType === AGENT_TASK_RESUME_CUSTOM_TYPE &&
+				isObjectRecord(message.details) &&
+				message.details.requestId === request.id,
+		);
+		if (alreadyScheduled || alreadyDelivered) {
+			graph.markResumeAdmitted(request.taskId, request.id, request.ownerAgentId);
+			this._sessionInputPumpSuspended = false;
+			this._scheduleSessionInputPump();
+			return "admitted";
+		}
+
+		const content = [
+			"[task gap resolution]",
+			"",
+			"The durable gaps below were resolved or declined. Refresh the task with `await rlm.task.current()`, continue only the remaining work, then call `await rlm.task.complete(result)` or report another durable gap.",
+			"",
+			JSON.stringify(
+				{
+					requestId: request.id,
+					taskId: request.taskId,
+					gaps: request.gaps.map((gap) => ({
+						id: gap.id,
+						kind: gap.kind,
+						status: gap.status,
+						description: gap.description,
+						resolution: gap.resolution,
+						evidenceRefs: gap.evidenceRefs,
+					})),
+					context: request.context,
+				},
+				null,
+				2,
+			),
+		].join("\n");
+		const message: CustomMessage<AgentTaskResumeMessageDetails> = {
+			role: "custom",
+			customType: AGENT_TASK_RESUME_CUSTOM_TYPE,
+			content,
+			display: true,
+			details: {
+				requestId: request.id,
+				taskId: request.taskId,
+				ownerAgentId: request.ownerAgentId,
+			},
+			timestamp: Date.now(),
+		};
+		const admissionFence = await this._acquireDirectTurnAdmissionFence();
+		try {
+			const immediatelyEligible = this._canStartSessionActionImmediately();
+			const action = this._createPreparedTurnAction("followUp", content, undefined, {
+				queueKey,
+				message,
+				resumeIfIdle: true,
+				source: "internal",
+				executionPolicy: this._turnExecutionPolicy("injected"),
+				queueVisible: false,
+			});
+			const admitted = this._admitSessionInput(action, {
+				immediatelyEligible,
+				wake: false,
+			});
+			if (!admitted.accepted) {
+				return "owner_unavailable";
+			}
+			graph.markResumeAdmitted(request.taskId, request.id, request.ownerAgentId);
+			this._sessionInputPumpSuspended = false;
+			this._scheduleSessionInputPump();
+			return "admitted";
+		} finally {
+			admissionFence.release();
+		}
+	}
+
+	private async _dispatchTaskResume(request: AgentTaskResumeDispatch): Promise<"admitted" | "owner_unavailable"> {
+		if (this._taskId === request.taskId) return this.admitTaskResume(request);
+		const hosted = await this._subagentRuntimeHost?.resumeTaskOwner?.(request);
+		if (hosted === "admitted") return hosted;
+		for (const child of this._rlmChildSessions.values()) {
+			const resumed = await child._dispatchTaskResume(request);
+			if (resumed === "admitted") return resumed;
+		}
+		return "owner_unavailable";
+	}
+
+	private _drainPendingTaskResumes(): Promise<void> {
+		if (!this._taskGraph) return Promise.resolve();
+		if (this._taskResumeDrain) return this._taskResumeDrain;
+		const drain = (async () => {
+			for (const request of this._taskGraph!.getPendingResumeRequests()) {
+				await this._dispatchTaskResume(request);
+			}
+		})();
+		let tracked!: Promise<void>;
+		tracked = drain.finally(() => {
+			if (this._taskResumeDrain === tracked) this._taskResumeDrain = undefined;
+		});
+		this._taskResumeDrain = tracked;
+		return this._taskResumeDrain;
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -9021,7 +9159,10 @@ export class AgentSession {
 		return handlers;
 	}
 
-	private handleAgentTaskHostRequest(type: string, payload: Record<string, unknown>): Record<string, unknown> {
+	private async handleAgentTaskHostRequest(
+		type: string,
+		payload: Record<string, unknown>,
+	): Promise<Record<string, unknown>> {
 		const graph = this._taskGraph;
 		const taskId = this._taskId;
 		const callerAgentId = this._taskActorId;
@@ -9069,19 +9210,17 @@ export class AgentSession {
 						evidenceRefs: optionalStringArray(payload.evidence_refs, "evidence_refs"),
 					}),
 				};
-			case "rlm.task.resolve_gap":
-				return {
-					gap: graph.resolveGap(
-						requiredString(payload.task_id, "task_id"),
-						requiredString(payload.gap_id, "gap_id"),
-						callerAgentId,
-						{
-							status: requiredResolutionStatus(payload.status),
-							resolution: requiredString(payload.resolution, "resolution"),
-							evidenceRefs: optionalStringArray(payload.evidence_refs, "evidence_refs"),
-						},
-					),
-				};
+			case "rlm.task.resolve_gap": {
+				const targetTaskId = requiredString(payload.task_id, "task_id");
+				const gap = graph.resolveGap(targetTaskId, requiredString(payload.gap_id, "gap_id"), callerAgentId, {
+					status: requiredResolutionStatus(payload.status),
+					resolution: requiredString(payload.resolution, "resolution"),
+					evidenceRefs: optionalStringArray(payload.evidence_refs, "evidence_refs"),
+				});
+				const request = graph.getPendingResumeRequests().find((candidate) => candidate.taskId === targetTaskId);
+				const resumeDelivery = request ? await this._dispatchTaskResume(request) : undefined;
+				return { gap, ...(resumeDelivery ? { resumeDelivery } : {}) };
+			}
 			case "rlm.task.cancel":
 				return {
 					task: graph.cancelTask(
