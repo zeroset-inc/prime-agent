@@ -359,25 +359,29 @@ jobs:
           fi
 
           BETA_DIR=release-artifacts/beta
-          aws s3 cp "$BETA_DIR/beta.json" "s3://${R2_BUCKET}/beta.json" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type application/json \
-            --cache-control no-cache
+          if [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT_URL" ]; then
+            aws s3 cp "$BETA_DIR/beta.json" "s3://${R2_BUCKET}/beta.json" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              --content-type application/json \
+              --cache-control no-cache
 
-          aws s3 cp "$BETA_DIR/beta" "s3://${R2_BUCKET}/beta" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/plain \
-            --cache-control no-cache
+            aws s3 cp "$BETA_DIR/beta" "s3://${R2_BUCKET}/beta" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              --content-type text/plain \
+              --cache-control no-cache
 
-          aws s3 cp /tmp/prime-agent-install.sh "s3://${R2_BUCKET}/install.sh" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/x-shellscript \
-            --cache-control no-cache
+            aws s3 cp /tmp/prime-agent-install.sh "s3://${R2_BUCKET}/install.sh" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              --content-type text/x-shellscript \
+              --cache-control no-cache
 
-          aws s3 cp /tmp/prime-agent-install-beta.sh "s3://${R2_BUCKET}/install-beta.sh" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/x-shellscript \
-            --cache-control no-cache
+            aws s3 cp /tmp/prime-agent-install-beta.sh "s3://${R2_BUCKET}/install-beta.sh" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              --content-type text/x-shellscript \
+              --cache-control no-cache
+          else
+            echo "R2 is not configured; advancing only the GitHub beta channel."
+          fi
 
           printf 'Automated beta build from `%s` (`%s`).\n' "$DEFAULT_BRANCH" "$BUILD_REF" > /tmp/beta-release-notes.md
 
