@@ -262,12 +262,17 @@ function main() {
 		);
 	}
 	const requestedVersion = normalizeVersion(args.version || process.env.PRIME_AGENT_VERSION || workspaceVersion);
-	if (requestedVersion !== workspaceVersion) {
+	const expectedVersion = args.channel === "stable" ? workspaceVersion : `${workspaceVersion}-beta.`;
+	const versionMatchesSource =
+		args.channel === "stable" ? requestedVersion === expectedVersion : requestedVersion.startsWith(expectedVersion);
+	if (!versionMatchesSource) {
 		throw new Error(
-			`Requested release version ${requestedVersion} must match source package version ${workspaceVersion}`,
+			args.channel === "stable"
+				? `Requested stable release version ${requestedVersion} must match source package version ${workspaceVersion}`
+				: `Requested beta release version ${requestedVersion} must be derived from source package version ${workspaceVersion}`,
 		);
 	}
-	const releaseVersion = workspaceVersion;
+	const releaseVersion = requestedVersion;
 
 	for (const releasePackage of releasePackages) {
 		requireBuiltPackage(releasePackage.packageDir);
