@@ -3,7 +3,12 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { Agent, type AgentMessage, type StreamFn } from "@earendil-works/pi-agent-core";
+import {
+	Agent,
+	type AgentMessage,
+	type GetContinuationMessagesContext,
+	type StreamFn,
+} from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	type Context,
@@ -134,6 +139,7 @@ interface InspectableRlmSession {
 	_rlmChildUnsubscribes: Map<string, () => void>;
 	_createKernelHostHandlers(): HostRequestHandlers;
 	_drainPendingTaskResumes(): Promise<void>;
+	_getContinuationMessages(context: GetContinuationMessagesContext, signal?: AbortSignal): Promise<AgentMessage[]>;
 	_reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void>;
 }
 
@@ -811,6 +817,70 @@ describe("AgentSession rlm recursion", () => {
 		expect(
 			root.messages.find((message) => message.role === "custom" && message.customType === "agent_task_resume"),
 		).toMatchObject({ content: expect.stringContaining("Every delegated descendant is terminal") });
+		expect(graph.getTask(graph.rootTaskId)).toMatchObject({
+			status: "running",
+			resumeRequest: { reason: "descendants_terminal", status: "admitted" },
+		});
+		await root.disposeAsync();
+	});
+
+	it("suspends goal and autonomous continuations while delegated descendants remain active", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "suspended-continuation-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "suspended-continuation-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: { requireExclusiveClaims: true },
+		});
+		const childTask = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: sessionManager.getSessionId(),
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review runtime.ts",
+				scope: "runtime.ts",
+				exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+				delegationReason: "Independent runtime boundary",
+			},
+		});
+		graph.startTask(childTask.id, "child-agent");
+		const root = createSession({ sessionManager, taskGraph: graph, taskId: graph.rootTaskId });
+		const internals = root as unknown as InspectableRlmSession;
+		const handlers = internals._createKernelHostHandlers();
+		const continuationContext: GetContinuationMessagesContext = {
+			message: assistantMessage("Delegated work is still running."),
+			toolResults: [],
+			context: root.agent.state,
+			newMessages: [],
+		};
+
+		root.handleGoalHostRequest("goal.create", { objective: "Finish the review" });
+		await root.prompt("/autonomous on");
+		await expect(handlers["rlm.task.defer_until_children_complete"]?.({})).resolves.toMatchObject({
+			state: "waiting",
+		});
+
+		await expect(internals._getContinuationMessages(continuationContext)).resolves.toEqual([]);
+		expect(root.goalState.continuationsUsed).toBe(0);
+		expect(root.getAutonomousStatus().continuationsUsed).toBe(0);
+
+		root.handleGoalHostRequest("goal.complete");
+		await expect(internals._getContinuationMessages(continuationContext)).resolves.toEqual([]);
+		expect(root.getAutonomousStatus().continuationsUsed).toBe(0);
+
+		graph.completeTaskFromRuntime(childTask.id, "child-agent", "Runtime review complete");
+		await internals._drainPendingTaskResumes();
+		await waitFor(
+			() =>
+				root.messages.filter((message) => message.role === "custom" && message.customType === "agent_task_resume")
+					.length === 1,
+		);
 		expect(graph.getTask(graph.rootTaskId)).toMatchObject({
 			status: "running",
 			resumeRequest: { reason: "descendants_terminal", status: "admitted" },
