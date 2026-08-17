@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-08-17
+
 - Fixed durable descendant waits allowing goal and autonomous continuations to poll before synthesis resumed.
 
 ## [0.7.7] - 2026-08-17
