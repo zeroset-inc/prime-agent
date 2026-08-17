@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-08-17
+
 - Added a recursive session-family quiescence barrier for headless runtimes and delegated task completion.
 
 ## [0.7.5] - 2026-08-17
