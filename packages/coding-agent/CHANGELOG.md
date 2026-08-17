@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-08-17
+
 - Added durable event-driven coordinator suspension and one-shot synthesis resumption for delegated task subtrees.
 - Fixed whole-tree usage totals by reconciling stable child attribution identities with active, first-turn, and disposed descendants without double counting.
 
