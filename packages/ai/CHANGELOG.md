@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed Cloudflare AI Gateway model generation to preserve provider-native Anthropic IDs when upstream catalog display IDs use dotted versions.
+
 ## [0.7.8] - 2026-08-17
 
 - Fixed clean browser bundles of the Mistral provider by declaring its telemetry runtime dependency.
