@@ -202,6 +202,83 @@ describe("AgentTaskGraph", () => {
 		expect(graph.hasActiveDescendants(graph.rootTaskId)).toBe(false);
 	});
 
+	it("durably defers a coordinator and exposes one resume only after all descendants are terminal", () => {
+		const graph = open();
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent boundary",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+
+		const waiting = graph.deferUntilDescendantsComplete(graph.rootTaskId, "root-agent");
+		expect(waiting).toMatchObject({
+			state: "waiting",
+			task: { status: "pending" },
+			request: { reason: "descendants_terminal", status: "pending" },
+		});
+		expect(graph.getPendingResumeRequests()).toEqual([]);
+		expect(graph.getSupervisionAlerts()).toContainEqual(
+			expect.objectContaining({ taskId: graph.rootTaskId, kind: "waiting_for_descendants" }),
+		);
+
+		graph.completeTaskFromRuntime(child.id, "child-agent", "Reviewed a.ts");
+		expect(graph.getPendingResumeRequests()).toHaveLength(1);
+		expect(graph.getPendingResumeRequests()[0]).toMatchObject({
+			taskId: graph.rootTaskId,
+			reason: "descendants_terminal",
+			gaps: [],
+		});
+		expect(graph.deferUntilDescendantsComplete(graph.rootTaskId, "root-agent")).toMatchObject({
+			state: "ready",
+			task: { status: "running", resumeRequest: { status: "admitted" } },
+		});
+		expect(graph.getPendingResumeRequests()).toEqual([]);
+	});
+
+	it("recovers a durable descendant wait and resumes after orphaned children are interrupted", () => {
+		const graph = open();
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent boundary",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		graph.deferUntilDescendantsComplete(graph.rootTaskId, "root-agent");
+
+		const restored = AgentTaskGraph.open({
+			directory: directory!,
+			root: { ownerAgentId: "restored-root", objective: "Review the change" },
+			policy: { requireExclusiveClaims: true },
+		});
+
+		expect(restored.getTask(child.id).status).toBe("interrupted");
+		expect(restored.getTask(restored.rootTaskId)).toMatchObject({
+			ownerAgentId: "restored-root",
+			status: "pending",
+			resumeRequest: { reason: "descendants_terminal", status: "pending" },
+		});
+		expect(restored.getPendingResumeRequests()).toEqual([
+			expect.objectContaining({
+				taskId: restored.rootTaskId,
+				ownerAgentId: "restored-root",
+				reason: "descendants_terminal",
+			}),
+		]);
+	});
+
 	it("cancels descendant waits and wakes them on fatal journal failure", async () => {
 		const graph = open();
 		const child = graph.reserveDelegation({

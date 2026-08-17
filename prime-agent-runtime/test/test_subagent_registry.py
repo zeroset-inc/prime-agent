@@ -200,6 +200,15 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(context, {"manifest": ["a.ts"]})
         host_request.assert_awaited_once_with("rlm.task.root_context")
 
+    def test_defers_coordinator_until_descendants_complete(self) -> None:
+        host_request = AsyncMock(return_value={"state": "waiting"})
+
+        with patch.object(rlm_module, "host_request", host_request):
+            result = asyncio.run(rlm_module.rlm.task.defer_until_children_complete())
+
+        self.assertEqual(result, {"state": "waiting"})
+        host_request.assert_awaited_once_with("rlm.task.defer_until_children_complete")
+
     def test_finds_authenticated_models_through_host(self) -> None:
         host_request = AsyncMock(
             return_value={

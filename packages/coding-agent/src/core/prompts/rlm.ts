@@ -142,11 +142,14 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 				"This run has a durable task graph. Inspect it with `await rlm.task.current()` and `await rlm.task.snapshot()`; snapshots include generic supervision alerts for blocked, stalled, uncertain, or synthesis-ready tasks.",
 				"Delegate coordinated work with `await rlm.delegate(prompt, task={...})`. The task must be genuinely narrower, transfer exclusive claims you own, include explicit scope and exclusions, and include enough context to avoid repository-wide rediscovery.",
 				"After transfer, coordinate that scope instead of repeating it. Children may recursively delegate under the same ownership rule. Direct parents supervise their children and the root can supervise the whole tree. Report missing context with `await rlm.task.report_gap(...)`, persist progress with `await rlm.task.update(...)`, and finish with `await rlm.task.complete(result)`.",
+				"When delegated descendants are still active, call `await rlm.task.defer_until_children_complete()` once and end the turn. Prime durably suspends the coordinator and resumes it with one synthesis turn after the whole descendant subtree is terminal; never poll, sleep, or repeatedly inspect task status.",
 			);
 		}
 		if (hasAgentMessage) {
 			parts.push(
-				"Children reply explicitly with `await agent_message.send(message, receiver_role='parent')` when an answer is needed. Replies and follow-ups arrive as ordinary agent messages; not every task requires a reply.",
+				options.coordinatedTasks
+					? "For coordinated work, put the completion result in `rlm.task.complete(...)`; do not duplicate it in an agent message. Use `agent_message.send(...)` only for an urgent question or intermediate coordination that cannot wait for synthesis."
+					: "Children reply explicitly with `await agent_message.send(message, receiver_role='parent')` when an answer is needed. Replies and follow-ups arrive as ordinary agent messages; not every task requires a reply.",
 				"Use `await agent_message.list_agents()` to discover family and `await rlm.list_subagents()` to recover direct child handles. Use `agent_message.send(..., receiver_role='child', receiver_name=child.name)` for follow-ups.",
 			);
 		} else {
@@ -160,7 +163,9 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			parts.push("Inspect files a child wrote when you need to collect its work without an observation capability.");
 		}
 		parts.push(
-			"Spawn independent children in separate calls and end your turn instead of awaiting completion. Multiple replies may arrive over multiple turns. Delete a direct child explicitly with `await rlm.delete_subagent(child)` when it is no longer needed.",
+			options.coordinatedTasks
+				? "Spawn independent children in separate calls, register the task-graph wait, and end your turn. Prime coalesces coordinated completion into one synthesis resume. Delete a direct child explicitly with `await rlm.delete_subagent(child)` when it is no longer needed."
+				: "Spawn independent children in separate calls and end your turn instead of awaiting completion. Multiple replies may arrive over multiple turns. Delete a direct child explicitly with `await rlm.delete_subagent(child)` when it is no longer needed.",
 		);
 	}
 

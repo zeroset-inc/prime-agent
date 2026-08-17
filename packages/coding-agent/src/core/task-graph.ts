@@ -94,6 +94,8 @@ export interface AgentTaskResumeRequest {
 	id: string;
 	taskId: string;
 	ownerAgentId: string;
+	/** Missing on pre-0.7.7 snapshots, which are gap-resolution resumes. */
+	reason?: "gap_resolution" | "descendants_terminal";
 	gapIds: string[];
 	gapCount: number;
 	status: "pending" | "admitted";
@@ -169,7 +171,13 @@ export interface AgentTaskGraphPage {
 export interface AgentTaskSupervisionAlert {
 	taskId: string;
 	ownerAgentId: string;
-	kind: "blocked_gap" | "resume_pending" | "stalled" | "ready_for_synthesis" | "reported_uncertainty";
+	kind:
+		| "blocked_gap"
+		| "waiting_for_descendants"
+		| "resume_pending"
+		| "stalled"
+		| "ready_for_synthesis"
+		| "reported_uncertainty";
 	message: string;
 	directParentTaskId?: string;
 	ageMs?: number;
@@ -366,7 +374,25 @@ export class AgentTaskGraph {
 		const alerts: AgentTaskSupervisionAlert[] = [];
 		for (const task of this.state.tasks) {
 			const parent = task.parentTaskId ? this.findTask(task.parentTaskId) : undefined;
-			if (task.status === "pending" && task.resumeRequest?.status === "pending") {
+			if (
+				task.status === "pending" &&
+				task.resumeRequest?.status === "pending" &&
+				task.resumeRequest.reason === "descendants_terminal" &&
+				this.hasActiveDescendants(task.id)
+			) {
+				alerts.push({
+					taskId: task.id,
+					ownerAgentId: task.ownerAgentId,
+					kind: "waiting_for_descendants",
+					message: "Coordinator is suspended until its delegated descendants are terminal",
+					...(parent ? { directParentTaskId: parent.id } : {}),
+				});
+			}
+			if (
+				task.status === "pending" &&
+				task.resumeRequest?.status === "pending" &&
+				(task.resumeRequest.reason !== "descendants_terminal" || !this.hasActiveDescendants(task.id))
+			) {
 				alerts.push({
 					taskId: task.id,
 					ownerAgentId: task.ownerAgentId,
@@ -466,6 +492,7 @@ export class AgentTaskGraph {
 		return this.state.tasks.flatMap((task) => {
 			const request = task.resumeRequest;
 			if (task.status !== "pending" || request?.status !== "pending") return [];
+			if (request.reason === "descendants_terminal" && this.hasActiveDescendants(task.id)) return [];
 			return [
 				{
 					...clone(request),
@@ -475,6 +502,41 @@ export class AgentTaskGraph {
 				},
 			];
 		});
+	}
+
+	deferUntilDescendantsComplete(
+		taskId: string,
+		callerAgentId: string,
+	): { state: "ready"; task: AgentTask } | { state: "waiting"; task: AgentTask; request: AgentTaskResumeRequest } {
+		const task = this.findTask(taskId);
+		this.assertOwner(task, callerAgentId);
+		this.assertActive(task, "wait for descendants of");
+		if (task.resumeRequest?.status === "pending") {
+			if (task.resumeRequest.reason !== "descendants_terminal") {
+				throw new AgentTaskGraphError(`task ${taskId} is already waiting for a different resume condition`);
+			}
+			if (!this.hasActiveDescendants(task.id)) {
+				return {
+					state: "ready",
+					task: this.markResumeAdmitted(task.id, task.resumeRequest.id, callerAgentId),
+				};
+			}
+			return { state: "waiting", task: clone(task), request: clone(task.resumeRequest) };
+		}
+		if (!this.hasActiveDescendants(task.id)) return { state: "ready", task: clone(task) };
+		const request: AgentTaskResumeRequest = {
+			id: `resume-descendants-${randomUUID()}`,
+			taskId: task.id,
+			ownerAgentId: task.ownerAgentId,
+			reason: "descendants_terminal",
+			gapIds: [],
+			gapCount: task.gaps.length,
+			status: "pending",
+			requestedAt: new Date().toISOString(),
+		};
+		const next = touchTask({ ...task, status: "pending", resumeRequest: request });
+		this.commit("task.waiting_for_descendants", callerAgentId, [next]);
+		return { state: "waiting", task: clone(next), request: clone(request) };
 	}
 
 	reserveDelegation(input: {
@@ -716,6 +778,7 @@ export class AgentTaskGraph {
 							id: `resume-${nextGap.id}`,
 							taskId: task.id,
 							ownerAgentId: task.ownerAgentId,
+							reason: "gap_resolution" as const,
 							gapIds: gaps.slice(cycleStart).map((candidate) => candidate.id),
 							gapCount: gaps.length,
 							status: "pending" as const,
