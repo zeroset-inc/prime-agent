@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed blocked descendants leaving suspended supervisors idle instead of waking them for durable gap resolution.
+
 ## [0.7.8] - 2026-08-17
 
 - Fixed durable descendant waits allowing goal and autonomous continuations to poll before synthesis resumed.

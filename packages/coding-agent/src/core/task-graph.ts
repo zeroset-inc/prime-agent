@@ -95,7 +95,7 @@ export interface AgentTaskResumeRequest {
 	taskId: string;
 	ownerAgentId: string;
 	/** Missing on pre-0.7.7 snapshots, which are gap-resolution resumes. */
-	reason?: "gap_resolution" | "descendants_terminal";
+	reason?: "gap_resolution" | "descendants_terminal" | "supervision_required";
 	gapIds: string[];
 	gapCount: number;
 	status: "pending" | "admitted";
@@ -105,6 +105,8 @@ export interface AgentTaskResumeRequest {
 
 export interface AgentTaskResumeDispatch extends AgentTaskResumeRequest {
 	gaps: AgentTaskGap[];
+	/** Missing on dispatches produced by pre-supervision runtimes. */
+	supervisionAlerts?: AgentTaskSupervisionAlert[];
 	context: AgentTaskContextEnvelope;
 }
 
@@ -179,6 +181,7 @@ export interface AgentTaskSupervisionAlert {
 		| "ready_for_synthesis"
 		| "reported_uncertainty";
 	message: string;
+	gapId?: string;
 	directParentTaskId?: string;
 	ageMs?: number;
 }
@@ -397,7 +400,10 @@ export class AgentTaskGraph {
 					taskId: task.id,
 					ownerAgentId: task.ownerAgentId,
 					kind: "resume_pending",
-					message: "Resolved task gap is waiting for its owner runtime to admit a follow-up turn",
+					message:
+						task.resumeRequest.reason === "supervision_required"
+							? "A descendant gap is waiting for this supervisor to admit a follow-up turn"
+							: "Resolved task gap is waiting for its owner runtime to admit a follow-up turn",
 					...(parent ? { directParentTaskId: parent.id } : {}),
 				});
 			}
@@ -407,6 +413,7 @@ export class AgentTaskGraph {
 					ownerAgentId: task.ownerAgentId,
 					kind: "blocked_gap",
 					message: gap.description,
+					gapId: gap.id,
 					...(parent ? { directParentTaskId: parent.id } : {}),
 				});
 			}
@@ -498,6 +505,14 @@ export class AgentTaskGraph {
 					...clone(request),
 					ownerAgentId: task.ownerAgentId,
 					gaps: clone(task.gaps.filter((gap) => request.gapIds.includes(gap.id))),
+					supervisionAlerts:
+						request.reason === "supervision_required"
+							? clone(
+									this.getSupervisionAlerts().filter(
+										(alert) => alert.kind === "blocked_gap" && this.isDescendant(task.id, alert.taskId),
+									),
+								)
+							: [],
 					context: this.contextEnvelope(task.id),
 				},
 			];
@@ -740,7 +755,9 @@ export class AgentTaskGraph {
 			updatedAt: now,
 		};
 		const next = touchTask({ ...task, status: "blocked", gaps: [...task.gaps, gap] });
-		this.commit("task.gap_reported", callerAgentId, [next]);
+		const supervisor = this.findAvailableSupervisor(task);
+		const nextSupervisor = supervisor ? this.requestSupervision(supervisor, now) : undefined;
+		this.commit("task.gap_reported", callerAgentId, nextSupervisor ? [next, nextSupervisor] : [next]);
 		return clone(gap);
 	}
 
@@ -1272,6 +1289,44 @@ export class AgentTaskGraph {
 		return this.state.tasks.filter((task) => task.parentTaskId === taskId);
 	}
 
+	private isDescendant(taskId: string, candidateTaskId: string): boolean {
+		let current = this.findTask(candidateTaskId);
+		while (current.parentTaskId) {
+			if (current.parentTaskId === taskId) return true;
+			current = this.findTask(current.parentTaskId);
+		}
+		return false;
+	}
+
+	private findAvailableSupervisor(task: AgentTask): AgentTask | undefined {
+		let current = task.parentTaskId ? this.findTask(task.parentTaskId) : undefined;
+		while (current) {
+			if (ACTIVE_TASK_STATUSES.has(current.status) && current.status !== "blocked") return current;
+			current = current.parentTaskId ? this.findTask(current.parentTaskId) : undefined;
+		}
+		return undefined;
+	}
+
+	private requestSupervision(supervisor: AgentTask, requestedAt: string): AgentTask | undefined {
+		const pendingRequest = supervisor.resumeRequest?.status === "pending" ? supervisor.resumeRequest : undefined;
+		if (pendingRequest?.reason === "supervision_required") return undefined;
+		const resumedGapIds = pendingRequest?.reason === "gap_resolution" ? pendingRequest.gapIds : [];
+		return touchTask({
+			...supervisor,
+			status: "pending",
+			resumeRequest: {
+				id: `resume-supervision-${randomUUID()}`,
+				taskId: supervisor.id,
+				ownerAgentId: supervisor.ownerAgentId,
+				reason: "supervision_required",
+				gapIds: resumedGapIds,
+				gapCount: Math.max(supervisor.gaps.length, pendingRequest?.gapCount ?? 0),
+				status: "pending",
+				requestedAt,
+			},
+		});
+	}
+
 	private lineage(taskId: string): string[] {
 		const lineage: string[] = [];
 		let current: AgentTask | undefined = this.findTask(taskId);
@@ -1292,11 +1347,12 @@ export class AgentTaskGraph {
 
 	private assertCanSupervise(task: AgentTask, callerAgentId: string): void {
 		if (callerAgentId === this.state.rootAgentId) return;
-		if (!task.parentTaskId) throw new AgentTaskGraphError(`only root agent may supervise root task ${task.id}`);
-		const parent = this.findTask(task.parentTaskId);
-		if (parent.ownerAgentId !== callerAgentId) {
-			throw new AgentTaskGraphError(`agent ${callerAgentId} is not the direct supervisor of task ${task.id}`);
+		let ancestor = task.parentTaskId ? this.findTask(task.parentTaskId) : undefined;
+		while (ancestor) {
+			if (ancestor.ownerAgentId === callerAgentId) return;
+			ancestor = ancestor.parentTaskId ? this.findTask(ancestor.parentTaskId) : undefined;
 		}
+		throw new AgentTaskGraphError(`agent ${callerAgentId} is not an ancestor supervisor of task ${task.id}`);
 	}
 
 	private assertActive(task: AgentTask, operation: string): void {

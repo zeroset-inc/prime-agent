@@ -1515,12 +1515,19 @@ export class AgentSession {
 		}
 
 		const descendantsTerminal = request.reason === "descendants_terminal";
+		const supervisionRequired = request.reason === "supervision_required";
 		const content = [
-			descendantsTerminal ? "[delegated tasks completed]" : "[task gap resolution]",
+			descendantsTerminal
+				? "[delegated tasks completed]"
+				: supervisionRequired
+					? "[task supervision required]"
+					: "[task gap resolution]",
 			"",
 			descendantsTerminal
 				? "Every delegated descendant is terminal. Read their bounded results from `await rlm.task.snapshot()`, synthesize the owned task without repeating their exploration, then call `await rlm.task.complete(result)`."
-				: "The durable gaps below were resolved or declined. Refresh the task with `await rlm.task.current()`, continue only the remaining work, then call `await rlm.task.complete(result)` or report another durable gap.",
+				: supervisionRequired
+					? "One or more descendants are blocked on durable gaps. Inspect the alerts below and `await rlm.task.snapshot()`, resolve or decline each gap with `await rlm.task.resolve_gap(...)`, continue any newly unblocked owned work, then call `await rlm.task.defer_until_children_complete()` if descendants remain active. Supply narrowly missing context when available; do not repeat their owned exploration."
+					: "The durable gaps below were resolved or declined. Refresh the task with `await rlm.task.current()`, continue only the remaining work, then call `await rlm.task.complete(result)` or report another durable gap.",
 			"",
 			JSON.stringify(
 				{
@@ -1535,6 +1542,7 @@ export class AgentSession {
 						resolution: gap.resolution,
 						evidenceRefs: gap.evidenceRefs,
 					})),
+					supervisionAlerts: request.supervisionAlerts ?? [],
 					context: request.context,
 				},
 				null,
@@ -1609,10 +1617,19 @@ export class AgentSession {
 		return this._taskResumeDrain;
 	}
 
+	private _drainTaskFamilyPendingResumes(): Promise<void> {
+		let coordinator: AgentSession = this;
+		while (coordinator._quiescenceParent) coordinator = coordinator._quiescenceParent;
+		return coordinator._drainPendingTaskResumes();
+	}
+
 	private _hasPendingCoalescedDelegatedCompletionWait(): boolean {
 		if (!this._taskGraph || !this._taskId) return false;
 		const request = this._taskGraph.getTask(this._taskId).resumeRequest;
-		return request?.reason === "descendants_terminal" && request.status === "pending";
+		return (
+			(request?.reason === "descendants_terminal" || request?.reason === "supervision_required") &&
+			request.status === "pending"
+		);
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -9332,25 +9349,27 @@ export class AgentSession {
 						completedQuestions: optionalStringArray(payload.completed_questions, "completed_questions"),
 					}),
 				};
-			case "rlm.task.complete":
-				return {
-					task: graph.completeTask(
-						taskId,
-						callerAgentId,
-						requiredRecord(payload.result, "result") as unknown as AgentTaskResult,
-					),
-				};
-			case "rlm.task.report_gap":
-				return {
-					gap: graph.reportGap(taskId, callerAgentId, {
-						kind: requiredGapKind(payload.kind),
-						description: requiredString(payload.description, "description"),
-						...(typeof payload.needed_information === "string"
-							? { neededInformation: payload.needed_information }
-							: {}),
-						evidenceRefs: optionalStringArray(payload.evidence_refs, "evidence_refs"),
-					}),
-				};
+			case "rlm.task.complete": {
+				const task = graph.completeTask(
+					taskId,
+					callerAgentId,
+					requiredRecord(payload.result, "result") as unknown as AgentTaskResult,
+				);
+				await this._drainTaskFamilyPendingResumes();
+				return { task };
+			}
+			case "rlm.task.report_gap": {
+				const gap = graph.reportGap(taskId, callerAgentId, {
+					kind: requiredGapKind(payload.kind),
+					description: requiredString(payload.description, "description"),
+					...(typeof payload.needed_information === "string"
+						? { neededInformation: payload.needed_information }
+						: {}),
+					evidenceRefs: optionalStringArray(payload.evidence_refs, "evidence_refs"),
+				});
+				await this._drainTaskFamilyPendingResumes();
+				return { gap };
+			}
 			case "rlm.task.resolve_gap": {
 				const targetTaskId = requiredString(payload.task_id, "task_id");
 				const gap = graph.resolveGap(targetTaskId, requiredString(payload.gap_id, "gap_id"), callerAgentId, {
@@ -10060,6 +10079,7 @@ export class AgentSession {
 			void session.disposeAsync().catch(() => undefined);
 			return false;
 		}
+		session._quiescenceParent = this;
 		this._rlmChildSessions.set(childId, session);
 		if (unsubscribe) {
 			this._rlmChildUnsubscribes.set(childId, unsubscribe);
