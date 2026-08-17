@@ -120,6 +120,7 @@ import {
 	computeOwnAndTotalUsage,
 	loadContextTreeChildFromDisk,
 	loadContextTreeChildrenFromDisk,
+	reconcileContextTreeTotalUsage,
 } from "./context-tree.js";
 import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
 import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
@@ -1513,15 +1514,19 @@ export class AgentSession {
 			return "admitted";
 		}
 
+		const descendantsTerminal = request.reason === "descendants_terminal";
 		const content = [
-			"[task gap resolution]",
+			descendantsTerminal ? "[delegated tasks completed]" : "[task gap resolution]",
 			"",
-			"The durable gaps below were resolved or declined. Refresh the task with `await rlm.task.current()`, continue only the remaining work, then call `await rlm.task.complete(result)` or report another durable gap.",
+			descendantsTerminal
+				? "Every delegated descendant is terminal. Read their bounded results from `await rlm.task.snapshot()`, synthesize the owned task without repeating their exploration, then call `await rlm.task.complete(result)`."
+				: "The durable gaps below were resolved or declined. Refresh the task with `await rlm.task.current()`, continue only the remaining work, then call `await rlm.task.complete(result)` or report another durable gap.",
 			"",
 			JSON.stringify(
 				{
 					requestId: request.id,
 					taskId: request.taskId,
+					reason: request.reason ?? "gap_resolution",
 					gaps: request.gaps.map((gap) => ({
 						id: gap.id,
 						kind: gap.kind,
@@ -1602,6 +1607,12 @@ export class AgentSession {
 		this._taskResumeDrain = tracked;
 		this._notifyQuiescenceChange();
 		return this._taskResumeDrain;
+	}
+
+	private _hasPendingCoalescedDelegatedCompletionWait(): boolean {
+		if (!this._taskGraph || !this._taskId) return false;
+		const request = this._taskGraph.getTask(this._taskId).resumeRequest;
+		return request?.reason === "descendants_terminal" && request.status === "pending";
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -9187,6 +9198,7 @@ export class AgentSession {
 				"rlm.task.current",
 				"rlm.task.snapshot",
 				"rlm.task.root_context",
+				"rlm.task.defer_until_children_complete",
 				"rlm.task.update",
 				"rlm.task.complete",
 				"rlm.task.report_gap",
@@ -9310,6 +9322,8 @@ export class AgentSession {
 				};
 			case "rlm.task.root_context":
 				return { rootContext: graph.getRootContext() ?? null };
+			case "rlm.task.defer_until_children_complete":
+				return graph.deferUntilDescendantsComplete(taskId, callerAgentId);
 			case "rlm.task.update":
 				return {
 					task: graph.updateProgress(taskId, callerAgentId, {
@@ -10446,6 +10460,7 @@ export class AgentSession {
 										assistant.usage,
 										parentAssistantForUsage.usage,
 										origin,
+										childNodeId,
 									);
 								}
 							}
@@ -10507,6 +10522,7 @@ export class AgentSession {
 				await child.waitForQuiescence({ signal: startupAbortController.signal });
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
+				let suppressTerminalMessage = false;
 				if (delegatedTaskId && this._taskGraph) {
 					const stillOwned = this._taskGraph.getTask(delegatedTaskId).ownerAgentId === childNodeId;
 					if (stillOwned && this._taskGraph.canAutoCompleteTask(delegatedTaskId)) {
@@ -10516,11 +10532,16 @@ export class AgentSession {
 							child.getLastAssistantText() ?? "Task completed without a textual result.",
 						);
 					}
+					suppressTerminalMessage = this._hasPendingCoalescedDelegatedCompletionWait();
 				}
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
-				if (!run.detachedDeletion && child._parentReplyCount === parentReplyCountBeforeRun) {
+				if (
+					!run.detachedDeletion &&
+					child._parentReplyCount === parentReplyCountBeforeRun &&
+					!suppressTerminalMessage
+				) {
 					const lastAssistantText = child.getLastAssistantText();
 					await deliverTerminalMessageToParent(
 						createRlmChildTerminalNoticeMessage({
@@ -10530,6 +10551,9 @@ export class AgentSession {
 							lastAssistantTextPreview: lastAssistantText ? compactRlmText(lastAssistantText) : undefined,
 						}),
 					);
+				}
+				if (delegatedTaskId && this._taskGraph) {
+					await this._drainPendingTaskResumes().catch(() => undefined);
 				}
 				if (!this.registerRlmChildSession(run.id, child)) {
 					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
@@ -10542,10 +10566,12 @@ export class AgentSession {
 				}
 			} catch (error) {
 				const runError = error instanceof Error ? error : new Error(String(error));
+				let suppressTerminalMessage = false;
 				if (delegatedTaskId && this._taskGraph) {
 					if (this._taskGraph.getTask(delegatedTaskId).ownerAgentId === childNodeId) {
 						this._taskGraph.interruptTask(delegatedTaskId, childNodeId, runError.message);
 					}
+					suppressTerminalMessage = this._hasPendingCoalescedDelegatedCompletionWait();
 				}
 				run.publication.reject(runError);
 				if (run.status !== "cancelled") {
@@ -10555,7 +10581,7 @@ export class AgentSession {
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();
-				if (!run.detachedDeletion) {
+				if (!run.detachedDeletion && !suppressTerminalMessage) {
 					if (run.status === "error") {
 						await deliverTerminalMessageToParent(
 							createRlmChildFailureMessage({
@@ -10574,6 +10600,9 @@ export class AgentSession {
 							}),
 						);
 					}
+				}
+				if (delegatedTaskId && this._taskGraph) {
+					await this._drainPendingTaskResumes().catch(() => undefined);
 				}
 				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 					try {
@@ -11749,10 +11778,12 @@ export class AgentSession {
 	 */
 	getContextTree(): ContextTreeNode {
 		const resolveContextWindow = this._contextWindowResolver();
-		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(
-			this.sessionManager.getBranch(),
-			this.sessionManager.getEntries(),
-		);
+		const {
+			ownUsage,
+			totalUsage: attributedTotalUsage,
+			identifiedChildUsage,
+			unidentifiedChildUsage,
+		} = computeOwnAndTotalUsage(this.sessionManager.getBranch(), this.sessionManager.getEntries());
 
 		const children: ContextTreeNode[] = [];
 		const liveIds = new Set<string>();
@@ -11780,7 +11811,13 @@ export class AgentSession {
 			status: "active",
 			model: model ? { provider: model.provider, id: model.id } : undefined,
 			ownUsage,
-			totalUsage,
+			totalUsage: reconcileContextTreeTotalUsage(
+				ownUsage,
+				attributedTotalUsage,
+				children,
+				identifiedChildUsage,
+				unidentifiedChildUsage,
+			),
 			contextUsage: this.getContextUsage(),
 			children,
 		};

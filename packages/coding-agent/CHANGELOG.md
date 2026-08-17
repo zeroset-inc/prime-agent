@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Added durable event-driven coordinator suspension and one-shot synthesis resumption for delegated task subtrees.
+- Fixed whole-tree usage totals by reconciling stable child attribution identities with active, first-turn, and disposed descendants without double counting.
+
 ## [0.7.6] - 2026-08-17
 
 - Added a recursive session-family quiescence barrier for headless runtimes and delegated task completion.

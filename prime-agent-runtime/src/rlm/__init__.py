@@ -209,6 +209,15 @@ class _RLMTaskAPI:
             raise RuntimeError("rlm.task.root_context returned an invalid context")
         return value
 
+    async def defer_until_children_complete(self) -> dict[str, Any]:
+        """Suspend coordination and request one follow-up after descendants finish.
+
+        The call returns immediately after the durable wait is registered. When
+        ``state`` is ``waiting``, end the current turn; Prime resumes the task
+        automatically once every delegated descendant is terminal.
+        """
+        return await host_request("rlm.task.defer_until_children_complete")
+
     async def update(
         self,
         summary: str,

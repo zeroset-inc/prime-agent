@@ -133,6 +133,7 @@ interface InspectableRlmSession {
 	_rlmChildSessions: Map<string, AgentSession>;
 	_rlmChildUnsubscribes: Map<string, () => void>;
 	_createKernelHostHandlers(): HostRequestHandlers;
+	_drainPendingTaskResumes(): Promise<void>;
 	_reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void>;
 }
 
@@ -764,6 +765,57 @@ describe("AgentSession rlm recursion", () => {
 		await expect(handlers["rlm.task.current"]?.({})).resolves.toMatchObject({
 			task: { id: spawned.task_id, status: "completed" },
 		});
+	});
+
+	it("coalesces delegated completion into one event-driven synthesis resume", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "coalesced-resume-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "coalesced-resume-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: { requireExclusiveClaims: true },
+		});
+		const childTask = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: sessionManager.getSessionId(),
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review runtime.ts",
+				scope: "runtime.ts",
+				exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+				delegationReason: "Independent runtime boundary",
+			},
+		});
+		graph.startTask(childTask.id, "child-agent");
+		const root = createSession({ sessionManager, taskGraph: graph, taskId: graph.rootTaskId });
+		const internals = root as unknown as InspectableRlmSession;
+		const handlers = internals._createKernelHostHandlers();
+
+		await expect(handlers["rlm.task.defer_until_children_complete"]?.({})).resolves.toMatchObject({
+			state: "waiting",
+			request: { reason: "descendants_terminal" },
+		});
+		graph.completeTaskFromRuntime(childTask.id, "child-agent", "Runtime review complete");
+		await internals._drainPendingTaskResumes();
+		await waitFor(
+			() =>
+				root.messages.filter((message) => message.role === "custom" && message.customType === "agent_task_resume")
+					.length === 1,
+		);
+		expect(
+			root.messages.find((message) => message.role === "custom" && message.customType === "agent_task_resume"),
+		).toMatchObject({ content: expect.stringContaining("Every delegated descendant is terminal") });
+		expect(graph.getTask(graph.rootTaskId)).toMatchObject({
+			status: "running",
+			resumeRequest: { reason: "descendants_terminal", status: "admitted" },
+		});
+		await root.disposeAsync();
 	});
 
 	it("wakes a nested task owner exactly once after its final gap is resolved", async () => {
@@ -2140,6 +2192,7 @@ describe("AgentSession rlm recursion", () => {
 		const reloaded = SessionManager.open(sessionFile, join(tempDir, "sessions"));
 		const attribution = reloaded.getEntries().find((entry) => entry.type === "child_usage_attributed");
 		if (!attribution || attribution.type !== "child_usage_attributed") throw new Error("missing attribution");
+		expect(attribution.childId).toMatch(/^sub-/);
 		expect(attribution.childUsage.input).toBe(7);
 		expect(attribution.childUsage.output).toBe(3);
 		expect(attribution.aggregateUsage.cost.total).toBe(10);
