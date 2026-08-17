@@ -824,6 +824,109 @@ describe("AgentSession rlm recursion", () => {
 		await root.disposeAsync();
 	});
 
+	it("wakes a suspended supervisor for a descendant gap and resumes synthesis after resolution", async () => {
+		const rootSessionManager = SessionManager.create(tempDir, join(tempDir, "gap-supervision-root"));
+		const childSessionManager = SessionManager.create(tempDir, join(tempDir, "gap-supervision-child"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "gap-supervision-coordination"),
+			root: {
+				ownerAgentId: rootSessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: { requireExclusiveClaims: true },
+		});
+		const childTask = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: rootSessionManager.getSessionId(),
+			childAgentId: childSessionManager.getSessionId(),
+			task: {
+				objective: "Review runtime.ts",
+				scope: "runtime.ts",
+				exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+				delegationReason: "Independent runtime boundary",
+			},
+		});
+		graph.startTask(childTask.id, childSessionManager.getSessionId());
+		const root = createSession({ sessionManager: rootSessionManager, taskGraph: graph, taskId: graph.rootTaskId });
+		const child = createSession({
+			sessionManager: childSessionManager,
+			taskGraph: graph,
+			taskId: childTask.id,
+			depth: 1,
+		});
+		root.registerRlmChildSession(childSessionManager.getSessionId(), child);
+		const rootHandlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
+		const childHandlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
+
+		await expect(rootHandlers["rlm.task.defer_until_children_complete"]?.({})).resolves.toMatchObject({
+			state: "waiting",
+		});
+		const gapResult = await childHandlers["rlm.task.report_gap"]?.({
+			kind: "coverage",
+			description: "Terraform is unavailable for native validation",
+		});
+		const gap = gapResult?.gap as { id: string };
+		await waitFor(
+			() =>
+				root.messages.filter((message) => message.role === "custom" && message.customType === "agent_task_resume")
+					.length === 1,
+		);
+		expect(
+			root.messages.find((message) => message.role === "custom" && message.customType === "agent_task_resume"),
+		).toMatchObject({
+			content: expect.stringContaining("Terraform is unavailable for native validation"),
+		});
+		expect(graph.getTask(graph.rootTaskId)).toMatchObject({
+			status: "running",
+			resumeRequest: { reason: "supervision_required", status: "admitted" },
+		});
+
+		await expect(
+			rootHandlers["rlm.task.resolve_gap"]?.({
+				task_id: childTask.id,
+				gap_id: gap.id,
+				status: "declined",
+				resolution: "Native Terraform validation is optional for this bounded source review",
+			}),
+		).resolves.toMatchObject({ resumeDelivery: "admitted" });
+		await waitFor(
+			() =>
+				child.messages.filter((message) => message.role === "custom" && message.customType === "agent_task_resume")
+					.length === 1,
+		);
+		await expect(rootHandlers["rlm.task.defer_until_children_complete"]?.({})).resolves.toMatchObject({
+			state: "waiting",
+		});
+		await childHandlers["rlm.task.complete"]?.({
+			result: {
+				summary: "Runtime review complete",
+				verification: [],
+				candidateFindings: [],
+				unresolvedQuestions: [],
+				coverageGaps: [],
+				evidenceRefs: [],
+			},
+		});
+		await waitFor(
+			() =>
+				root.messages.filter((message) => message.role === "custom" && message.customType === "agent_task_resume")
+					.length === 2,
+		);
+		expect(
+			root.messages.filter((message) => message.role === "custom" && message.customType === "agent_task_resume")[1],
+		).toMatchObject({ content: expect.stringContaining("Every delegated descendant is terminal") });
+		expect(graph.getTask(graph.rootTaskId)).toMatchObject({
+			status: "running",
+			resumeRequest: { reason: "descendants_terminal", status: "admitted" },
+		});
+
+		await root.disposeAsync();
+	});
+
 	it("suspends goal and autonomous continuations while delegated descendants remain active", async () => {
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "suspended-continuation-sessions"));
 		const graph = AgentTaskGraph.open({
@@ -973,6 +1076,7 @@ describe("AgentSession rlm recursion", () => {
 		const request = {
 			...task.resumeRequest!,
 			gaps: task.gaps,
+			supervisionAlerts: [],
 			context: graph.contextEnvelope(task.id),
 		};
 		await expect(grandchild.admitTaskResume(request)).resolves.toBe("admitted");
