@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed durable descendant waits allowing goal and autonomous continuations to poll before synthesis resumed.
+
 ## [0.7.7] - 2026-08-17
 
 - Added durable event-driven coordinator suspension and one-shot synthesis resumption for delegated task subtrees.

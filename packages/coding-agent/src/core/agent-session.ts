@@ -3422,7 +3422,7 @@ export class AgentSession {
 		context: GetContinuationMessagesContext,
 		signal?: AbortSignal,
 	): Promise<AgentMessage[]> {
-		if (this.queuedActionCount > 0) {
+		if (this.queuedActionCount > 0 || this._hasPendingCoalescedDelegatedCompletionWait()) {
 			return [];
 		}
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
