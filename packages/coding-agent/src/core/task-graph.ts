@@ -265,6 +265,7 @@ export class AgentTaskGraph {
 	private bytesSinceSnapshot = 0;
 	private degradedError?: Error;
 	private fatalError?: Error;
+	private readonly changeWaiters = new Set<() => void>();
 
 	private constructor(options: OpenAgentTaskGraphOptions) {
 		this.policy = options.policy ?? {};
@@ -846,6 +847,47 @@ export class AgentTaskGraph {
 		}
 	}
 
+	hasActiveDescendants(taskId: string): boolean {
+		this.findTask(taskId);
+		const pending = [...this.childrenOf(taskId)];
+		while (pending.length > 0) {
+			const task = pending.pop()!;
+			if (ACTIVE_TASK_STATUSES.has(task.status)) return true;
+			pending.push(...this.childrenOf(task.id));
+		}
+		return false;
+	}
+
+	async waitForDescendantsComplete(taskId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+		this.findTask(taskId);
+		while (true) {
+			if (this.fatalError) {
+				throw new AgentTaskGraphError(`task graph durability failed: ${this.fatalError.message}`);
+			}
+			if (options.signal?.aborted) throw new AgentTaskGraphError("task descendant wait cancelled");
+			if (!this.hasActiveDescendants(taskId)) return;
+			await new Promise<void>((resolve, reject) => {
+				const onChange = () => {
+					cleanup();
+					resolve();
+				};
+				const onAbort = () => {
+					cleanup();
+					reject(new AgentTaskGraphError("task descendant wait cancelled"));
+				};
+				const cleanup = () => {
+					this.changeWaiters.delete(onChange);
+					options.signal?.removeEventListener("abort", onAbort);
+				};
+				this.changeWaiters.add(onChange);
+				options.signal?.addEventListener("abort", onAbort, { once: true });
+				// Close the predicate/subscription race without polling.
+				if (!this.hasActiveDescendants(taskId)) onChange();
+				else if (options.signal?.aborted) onAbort();
+			});
+		}
+	}
+
 	private loadOrCreate(rootInput: AgentTaskRootInput): AgentTaskGraphSnapshot {
 		if (existsSync(this.snapshotPath)) {
 			const loaded = parseSnapshot(readFileSync(this.snapshotPath, "utf8"));
@@ -1038,6 +1080,7 @@ export class AgentTaskGraph {
 		this.appendEvent(event);
 		this.state = next;
 		this.compactSnapshot(false);
+		this.notifyChangeWaiters();
 	}
 
 	private commitUsage(actorAgentId: string, nextTask: AgentTask, usage: AgentTaskUsage): void {
@@ -1064,6 +1107,13 @@ export class AgentTaskGraph {
 		});
 		this.state = next;
 		this.compactSnapshot(false);
+		this.notifyChangeWaiters();
+	}
+
+	private notifyChangeWaiters(): void {
+		const waiters = [...this.changeWaiters];
+		this.changeWaiters.clear();
+		for (const waiter of waiters) waiter();
 	}
 
 	private appendEvent(event: AgentTaskGraphEvent): void {
@@ -1074,6 +1124,7 @@ export class AgentTaskGraph {
 			this.bytesSinceSnapshot += Buffer.byteLength(encoded, "utf8");
 		} catch (error) {
 			this.fatalError = asError(error);
+			this.notifyChangeWaiters();
 			throw new AgentTaskGraphError(`task graph journal write failed: ${this.fatalError.message}`);
 		}
 	}

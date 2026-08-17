@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added a recursive session-family quiescence barrier for headless runtimes and delegated task completion.
+
 ## [0.7.5] - 2026-08-17
 
 - Fixed resolved task gaps leaving owners idle by durably scheduling one replay-safe follow-up for root, nested, reassigned, and restored task owners.

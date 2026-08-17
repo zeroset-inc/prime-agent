@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -162,6 +162,71 @@ describe("AgentTaskGraph", () => {
 				.exclusiveClaims.map((item) => item.key)
 				.sort(),
 		).toEqual(["a.ts", "b.ts", "c.ts"]);
+	});
+
+	it("waits event-first for every active descendant in a recursive subtree", async () => {
+		const graph = open();
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review runtime",
+				scope: "a.ts and b.ts",
+				exclusiveClaims: [claim("a.ts"), claim("b.ts")],
+				delegationReason: "Runtime boundary",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		const grandchild = graph.reserveDelegation({
+			parentTaskId: child.id,
+			callerAgentId: "child-agent",
+			childAgentId: "grandchild-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts only",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent concurrency concern",
+			},
+		});
+		graph.startTask(grandchild.id, "grandchild-agent");
+
+		let settled = false;
+		const wait = graph.waitForDescendantsComplete(graph.rootTaskId).then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		graph.interruptTask(child.id, "child-agent", "child runtime failed");
+		await wait;
+		expect(graph.hasActiveDescendants(graph.rootTaskId)).toBe(false);
+	});
+
+	it("cancels descendant waits and wakes them on fatal journal failure", async () => {
+		const graph = open();
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent file",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		const controller = new AbortController();
+		const cancelled = graph.waitForDescendantsComplete(graph.rootTaskId, { signal: controller.signal });
+		controller.abort();
+		await expect(cancelled).rejects.toThrow("cancelled");
+
+		const failed = graph.waitForDescendantsComplete(graph.rootTaskId);
+		chmodSync(join(directory!, "task-graph.events.jsonl"), 0o400);
+		expect(() => graph.updateProgress(child.id, "child-agent", { summary: "still working" })).toThrow(
+			"journal write failed",
+		);
+		await expect(failed).rejects.toThrow("durability failed");
 	});
 
 	it("enforces direct-parent supervision while granting the root global authority", () => {

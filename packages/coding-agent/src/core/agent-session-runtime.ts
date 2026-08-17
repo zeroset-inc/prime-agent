@@ -118,6 +118,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return this._session;
 	}
 
+	/** Wait until the hosted session family can no longer admit causally-related work. */
+	async waitForQuiescence(options: { signal?: AbortSignal } = {}): Promise<void> {
+		await this._session.waitForQuiescence(options);
+	}
+
 	get cwd(): string {
 		return this._services.cwd;
 	}
