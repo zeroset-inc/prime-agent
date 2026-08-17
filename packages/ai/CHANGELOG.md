@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-08-17
+
+- Fixed clean browser bundles of the Mistral provider by declaring its telemetry runtime dependency.
+
 ## [0.7.7] - 2026-08-17
 
 ## [0.7.6] - 2026-08-17
