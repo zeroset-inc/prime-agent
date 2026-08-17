@@ -149,6 +149,7 @@ describe("AgentSessionRuntime characterization", () => {
 
 	function createRuntimeWithFakeSession(options?: { onShutdown?: () => void }) {
 		const disposeSession = vi.fn();
+		const waitForQuiescence = vi.fn(async () => {});
 		const session = {
 			extensionRunner: {
 				hasHandlers: (event: string) => event === "session_shutdown" && options?.onShutdown !== undefined,
@@ -159,14 +160,24 @@ describe("AgentSessionRuntime characterization", () => {
 			setSubagentRuntimeHost: vi.fn(),
 			dispose: disposeSession,
 			disposeAsync: disposeSession,
+			waitForQuiescence,
 		} as unknown as AgentSession;
 		const services = { cwd: "/tmp", agentDir: "/tmp" } as unknown as AgentSessionServices;
 		const createRuntime: CreateAgentSessionRuntimeFactory = async () => {
 			throw new Error("unexpected runtime creation");
 		};
 		const runtime = new AgentSessionRuntime(session, services, createRuntime);
-		return { runtime, disposeSession };
+		return { runtime, disposeSession, waitForQuiescence };
 	}
+
+	it("exposes session-family quiescence at the runtime boundary", async () => {
+		const { runtime, waitForQuiescence } = createRuntimeWithFakeSession();
+		const controller = new AbortController();
+
+		await runtime.waitForQuiescence({ signal: controller.signal });
+
+		expect(waitForQuiescence).toHaveBeenCalledWith({ signal: controller.signal });
+	});
 
 	it("passes session config to replacement runtimes", async () => {
 		const calls: Array<Parameters<CreateAgentSessionRuntimeFactory>[0]> = [];

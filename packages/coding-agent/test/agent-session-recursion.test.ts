@@ -1482,6 +1482,112 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("waits for a queued child terminal result to finish its parent follow-up", async () => {
+		let releaseInitial: () => void = () => {};
+		const initialGate = new Promise<void>((resolve) => {
+			releaseInitial = resolve;
+		});
+		let releaseFollowUp: () => void = () => {};
+		const followUpGate = new Promise<void>((resolve) => {
+			releaseFollowUp = resolve;
+		});
+		let rootCalls = 0;
+		const child = createSession({ rlmSessionDir: join(tempDir, "terminal-child") });
+		const root = createSession({
+			streamFn: () => {
+				rootCalls += 1;
+				const stream = createAssistantMessageEventStream();
+				const gate = rootCalls === 1 ? initialGate : followUpGate;
+				void gate.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(`root answer ${rootCalls}`) });
+				});
+				return stream;
+			},
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+
+		const initial = root.promptAndWait("review");
+		await waitFor(() => rootCalls === 1);
+		const spawned = await root.runRlmChild("silent child", { name: "terminal-worker" });
+		await waitFor(() => !(root as unknown as InspectableRlmSession)._activeRlmChildRuns.has(spawned.rlm_child_id));
+
+		let quiescent = false;
+		const wait = root.waitForQuiescence().then(() => {
+			quiescent = true;
+		});
+		releaseInitial();
+		await initial;
+		await waitFor(() => rootCalls === 2);
+		await Promise.resolve();
+		expect(quiescent).toBe(false);
+		releaseFollowUp();
+		await wait;
+		expect(quiescent).toBe(true);
+	});
+
+	it("waits recursively for a grandchild before settling the root family", async () => {
+		let releaseChild: () => void = () => {};
+		const childGate = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let releaseGrandchild: () => void = () => {};
+		const grandchildGate = new Promise<void>((resolve) => {
+			releaseGrandchild = resolve;
+		});
+		let childStarted = false;
+		let grandchildStarted = false;
+		const grandchild = createSession({
+			rlmSessionDir: join(tempDir, "grandchild"),
+			streamFn: () => {
+				grandchildStarted = true;
+				const stream = createAssistantMessageEventStream();
+				void grandchildGate.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("grandchild done") });
+				});
+				return stream;
+			},
+		});
+		const child = createSession({
+			rlmSessionDir: join(tempDir, "child"),
+			streamFn: () => {
+				childStarted = true;
+				const stream = createAssistantMessageEventStream();
+				void childGate.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("child done") });
+				});
+				return stream;
+			},
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: grandchild }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+
+		await root.runRlmChild("child task", { name: "child-worker" });
+		await waitFor(() => childStarted);
+		await child.runRlmChild("grandchild task", { name: "grandchild-worker" });
+		await waitFor(() => grandchildStarted);
+		let quiescent = false;
+		const wait = root.waitForQuiescence().then(() => {
+			quiescent = true;
+		});
+		releaseChild();
+		await Promise.resolve();
+		expect(quiescent).toBe(false);
+		releaseGrandchild();
+		await wait;
+		expect(quiescent).toBe(true);
+	});
+
 	it("does not inject a terminal notice when a parent follow-up resets reply state after a reply", async () => {
 		const child = createSession({
 			depth: 1,
@@ -3099,6 +3205,10 @@ describe("AgentSession rlm recursion", () => {
 					nestedStarted = true;
 					void nestedRelease.then(() => {
 						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+					});
+				} else {
+					queueMicrotask(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage("terminal update handled") });
 					});
 				}
 				return stream;

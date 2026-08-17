@@ -962,6 +962,7 @@ interface RlmChildRun {
 	error?: string;
 	abort: () => void;
 	publication: AgentMessageDeferred;
+	settlement: AgentMessageDeferred;
 	/** Child session, once its runtime exists. Used to cancel nested child runs. */
 	session?: AgentSession;
 	/** True once the detached run task has finished its catch and cleanup paths. */
@@ -1224,6 +1225,7 @@ export class AgentSession {
 	private _userBashRunning = false;
 	private _userBashAbortRequested = false;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
+	private _bashDrainPromise?: Promise<void>;
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
@@ -1284,6 +1286,10 @@ export class AgentSession {
 	private _parentReplyCount = 0;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
+	private _pendingRlmSpawnAdmissions = 0;
+	private _quiescenceEpoch = 0;
+	private readonly _quiescenceWaiters = new Set<() => void>();
+	private _quiescenceParent?: AgentSession;
 	private _pendingRlmSubagentSessionNames = new Set<string>();
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
@@ -1326,6 +1332,7 @@ export class AgentSession {
 	private _turnIntervalAutoRefinePending = false;
 	private _postCompactionContinuationScheduled = false;
 	private _postCompactionContinuationTimer: ReturnType<typeof setTimeout> | undefined;
+	private _postCompactionContinuationOperation: Promise<void> | undefined;
 	private _postCompactionContinuationMessages: AgentMessage[] = [];
 	private _scheduledPostCompactionContinuationMessages: AgentMessage[] = [];
 	private _queuedAutonomousThresholdContinuations = new WeakMap<AssistantMessage, AgentMessage>();
@@ -1590,8 +1597,10 @@ export class AgentSession {
 		let tracked!: Promise<void>;
 		tracked = drain.finally(() => {
 			if (this._taskResumeDrain === tracked) this._taskResumeDrain = undefined;
+			this._notifyQuiescenceChange();
 		});
 		this._taskResumeDrain = tracked;
+		this._notifyQuiescenceChange();
 		return this._taskResumeDrain;
 	}
 
@@ -3625,6 +3634,7 @@ export class AgentSession {
 		this._retryPromise = new Promise((resolve) => {
 			this._retryResolve = resolve;
 		});
+		this._notifyQuiescenceChange();
 	}
 
 	private _findLastAssistantInMessages(messages: AgentMessage[]): AssistantMessage | undefined {
@@ -3842,6 +3852,7 @@ export class AgentSession {
 			this._retryResolve();
 			this._retryResolve = undefined;
 			this._retryPromise = undefined;
+			this._notifyQuiescenceChange();
 			this._scheduleSessionInputPump();
 		}
 	}
@@ -4018,6 +4029,7 @@ export class AgentSession {
 				return this._disposeCallbacksPromise;
 			}
 			this._disposing = true;
+			this._notifyQuiescenceChange();
 			this._sessionActionCommitDisposeAbortController.abort();
 			await this._disposeAsyncOnce();
 		})();
@@ -4207,6 +4219,7 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
+		this._notifyQuiescenceChange();
 		this._sessionActionCommitDisposeAbortController.abort();
 		try {
 			// Invalidate scheduled timers and abort any in-flight review so a late
@@ -5586,6 +5599,7 @@ export class AgentSession {
 			disposition,
 		});
 		this._sessionInputArrivalEpoch++;
+		this._notifyQuiescenceChange();
 		this._emitQueueUpdate();
 		if (
 			!options.restore &&
@@ -6804,6 +6818,99 @@ export class AgentSession {
 		}
 	}
 
+	/** Wait until this session and every recursively-owned child can no longer admit work. */
+	async waitForQuiescence(options: { signal?: AbortSignal } = {}): Promise<void> {
+		const signal = options.signal;
+		while (true) {
+			if (signal?.aborted || this._disposed || this._disposing) {
+				throw new Error("Session quiescence wait cancelled");
+			}
+			const epoch = this._quiescenceEpoch;
+			while (this._pendingRlmSpawnAdmissions > 0) {
+				await this._waitForQuiescenceChange(signal);
+			}
+			const runs = [...this._activeRlmChildRuns.values()].filter((run) => !run.settled);
+			await Promise.all(
+				runs.map((run) =>
+					waitForPromiseOrAbort(run.settlement.promise, signal, "Session quiescence wait cancelled"),
+				),
+			);
+			const children = new Set<AgentSession>(
+				[...this._rlmChildSessions.values()].filter((child) => !child._disposed && !child._disposing),
+			);
+			for (const run of this._activeRlmChildRuns.values()) {
+				if (run.session && !run.session._disposed && !run.session._disposing) children.add(run.session);
+			}
+			await Promise.all([...children].map((child) => child.waitForQuiescence({ signal })));
+			while (this._postCompactionContinuationScheduled || this._postCompactionContinuationOperation) {
+				await this._waitForQuiescenceChange(signal);
+			}
+			const detachedOperations = [
+				this._taskResumeDrain,
+				this._retryPromise,
+				this._bashDrainPromise,
+				...this._autoRefineOperations,
+			].filter((operation): operation is Promise<void> => operation !== undefined);
+			await Promise.all(
+				detachedOperations.map((operation) =>
+					waitForPromiseOrAbort(operation, signal, "Session quiescence wait cancelled"),
+				),
+			);
+			while (this._scheduledAutoRefineTimers.size > 0) {
+				await this._waitForQuiescenceChange(signal);
+			}
+			await waitForPromiseOrAbort(this.waitForIdle(), signal, "Session quiescence wait cancelled");
+			if (this._taskGraph && this._taskId) {
+				await this._taskGraph.waitForDescendantsComplete(this._taskId, { signal });
+			}
+			await Promise.resolve();
+			if (
+				epoch === this._quiescenceEpoch &&
+				this._pendingRlmSpawnAdmissions === 0 &&
+				![...this._activeRlmChildRuns.values()].some((run) => !run.settled) &&
+				!this._postCompactionContinuationScheduled &&
+				!this._postCompactionContinuationOperation &&
+				!this._taskResumeDrain &&
+				!this._retryPromise &&
+				!this._bashDrainPromise &&
+				this._scheduledAutoRefineTimers.size === 0 &&
+				this._autoRefineOperations.size === 0 &&
+				(!this._taskGraph || !this._taskId || !this._taskGraph.hasActiveDescendants(this._taskId))
+			) {
+				return;
+			}
+		}
+	}
+
+	private _notifyQuiescenceChange(): void {
+		this._quiescenceEpoch += 1;
+		const waiters = [...this._quiescenceWaiters];
+		this._quiescenceWaiters.clear();
+		for (const waiter of waiters) waiter();
+		this._quiescenceParent?._notifyQuiescenceChange();
+	}
+
+	private _waitForQuiescenceChange(signal?: AbortSignal): Promise<void> {
+		if (signal?.aborted) return Promise.reject(new Error("Session quiescence wait cancelled"));
+		return new Promise<void>((resolve, reject) => {
+			const onChange = () => {
+				cleanup();
+				resolve();
+			};
+			const onAbort = () => {
+				cleanup();
+				reject(new Error("Session quiescence wait cancelled"));
+			};
+			const cleanup = () => {
+				this._quiescenceWaiters.delete(onChange);
+				signal?.removeEventListener("abort", onAbort);
+			};
+			this._quiescenceWaiters.add(onChange);
+			signal?.addEventListener("abort", onAbort, { once: true });
+			if (signal?.aborted) onAbort();
+		});
+	}
+
 	getPendingNextTurnMessageSnapshots(): readonly CustomMessage[] {
 		const messages = this._pendingNextTurnMessages.map((message) => cloneCustomMessage(message));
 		for (const action of this._actionStore.unfinishedActions()) {
@@ -7546,6 +7653,7 @@ export class AgentSession {
 		}
 		this._postCompactionContinuationScheduled = false;
 		this._scheduledPostCompactionContinuationMessages = [];
+		this._notifyQuiescenceChange();
 	}
 
 	private _discardPendingAutoRefine(options: { cancelPostCompactionContinue?: boolean } = {}): void {
@@ -7644,10 +7752,21 @@ export class AgentSession {
 			return;
 		}
 		this._postCompactionContinuationScheduled = true;
+		this._notifyQuiescenceChange();
 		this._scheduledPostCompactionContinuationMessages = [...this._postCompactionContinuationMessages];
 		this._postCompactionContinuationTimer = setTimeout(() => {
 			this._postCompactionContinuationTimer = undefined;
-			void this._runScheduledPostCompactionContinue();
+			const operation = this._runScheduledPostCompactionContinue();
+			this._postCompactionContinuationOperation = operation;
+			this._notifyQuiescenceChange();
+			void operation
+				.finally(() => {
+					if (this._postCompactionContinuationOperation === operation) {
+						this._postCompactionContinuationOperation = undefined;
+					}
+					this._notifyQuiescenceChange();
+				})
+				.catch(() => undefined);
 		}, 100);
 	}
 
@@ -7752,14 +7871,22 @@ export class AgentSession {
 	private _scheduleAutoRefine(reason: AutoRefineReason, branchVersion = this._autoRefineBranchVersion): void {
 		const timer = setTimeout(() => {
 			this._scheduledAutoRefineTimers.delete(timer);
+			this._notifyQuiescenceChange();
 			if (branchVersion !== this._autoRefineBranchVersion) {
 				return;
 			}
 			const operation = this._maybeAutoRefine(reason);
 			this._autoRefineOperations.add(operation);
-			void operation.finally(() => this._autoRefineOperations.delete(operation)).catch(() => undefined);
+			this._notifyQuiescenceChange();
+			void operation
+				.finally(() => {
+					this._autoRefineOperations.delete(operation);
+					this._notifyQuiescenceChange();
+				})
+				.catch(() => undefined);
 		}, 0);
 		this._scheduledAutoRefineTimers.add(timer);
+		this._notifyQuiescenceChange();
 	}
 
 	private async _maybeAutoRefine(reason: AutoRefineReason): Promise<void> {
@@ -10095,6 +10222,23 @@ export class AgentSession {
 		delegation?: AgentTaskDelegationInput,
 		replacementTaskId?: string,
 	): Promise<RlmSpawnHandle> {
+		this._pendingRlmSpawnAdmissions += 1;
+		this._notifyQuiescenceChange();
+		try {
+			return await this._admitRlmChildRun(prompt, kwargs, spawnCode, delegation, replacementTaskId);
+		} finally {
+			this._pendingRlmSpawnAdmissions -= 1;
+			this._notifyQuiescenceChange();
+		}
+	}
+
+	private async _admitRlmChildRun(
+		prompt: string,
+		kwargs: Record<string, unknown> = {},
+		spawnCode?: string,
+		delegation?: AgentTaskDelegationInput,
+		replacementTaskId?: string,
+	): Promise<RlmSpawnHandle> {
 		if (delegation && replacementTaskId) throw new Error("cannot delegate and replace a task in one child run");
 		const { name: rawName, model: rawModel, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
@@ -10171,12 +10315,14 @@ export class AgentSession {
 			settled: false,
 			abort: () => startupAbortController.abort(),
 			publication: createAgentMessageDeferred(),
+			settlement: createAgentMessageDeferred(),
 			...(delegatedTaskId ? { taskId: delegatedTaskId } : {}),
 		};
 		const throwIfCancelled = () => {
 			if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 		};
 		this._activeRlmChildRuns.set(run.id, run);
+		this._notifyQuiescenceChange();
 		const emitChildUpdate = () => {
 			const childModel = childSession?.model ?? modelSelection.model;
 			this._emit({
@@ -10206,6 +10352,7 @@ export class AgentSession {
 
 		const publishChildSession = (child: AgentSession) => {
 			childSession = child;
+			child._quiescenceParent = this;
 			if (this._activeRlmChildRuns.get(run.id) !== run) return;
 			run.session = child;
 			run.abort = () => void child.abort();
@@ -10357,6 +10504,7 @@ export class AgentSession {
 					source: "extension",
 					customMessage: spawnMessage,
 				});
+				await child.waitForQuiescence({ signal: startupAbortController.signal });
 				if (run.error) throw new Error(run.error);
 				run.status = "done";
 				if (delegatedTaskId && this._taskGraph) {
@@ -10483,6 +10631,8 @@ export class AgentSession {
 					}
 				}
 				run.settled = true;
+				run.settlement.resolve();
+				this._notifyQuiescenceChange();
 			}
 		})().catch(() => undefined);
 
@@ -10722,6 +10872,7 @@ export class AgentSession {
 			this._retryPromise = new Promise((resolve) => {
 				this._retryResolve = resolve;
 			});
+			this._notifyQuiescenceChange();
 		}
 
 		this._retryAttempt++;
@@ -10947,7 +11098,15 @@ export class AgentSession {
 		// Emitted after the slot is released so clients never observe a bash_end
 		// while the session still rejects new commands as already running.
 		this._emit({ type: "bash_end", ...end, ...identity });
-		void this._drainQueuedMessagesAfterBash().catch(() => undefined);
+		const drain = this._drainQueuedMessagesAfterBash();
+		this._bashDrainPromise = drain;
+		this._notifyQuiescenceChange();
+		void drain
+			.finally(() => {
+				if (this._bashDrainPromise === drain) this._bashDrainPromise = undefined;
+				this._notifyQuiescenceChange();
+			})
+			.catch(() => undefined);
 	}
 
 	private async _drainQueuedMessagesAfterBash(): Promise<void> {
