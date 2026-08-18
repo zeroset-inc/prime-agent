@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added stable root/child roles to durable model-usage attribution so session replacement cannot relabel historical root calls as child work.
+
 ## [0.7.10] - 2026-08-18
 
 - Added durable per-task model-call attribution across root, delegated, replacement, and uncontracted agents.

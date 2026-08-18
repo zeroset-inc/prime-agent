@@ -3641,7 +3641,13 @@ export class AgentSession {
 					cost: usage.cost.total,
 				},
 				this._taskActorId ?? this.sessionId,
-				model ? { agentId: this.sessionId, model: `${model.provider}/${model.id}` } : undefined,
+				model
+					? {
+							agentId: this.sessionId,
+							agentKind: this._rlmDepth === 0 ? "root" : "child",
+							model: `${model.provider}/${model.id}`,
+						}
+					: undefined,
 			);
 			this._taskAccountingError = undefined;
 		} catch (error) {

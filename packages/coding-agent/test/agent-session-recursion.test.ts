@@ -803,6 +803,7 @@ describe("AgentSession rlm recursion", () => {
 		await root.prompt("review");
 
 		expect(graph.getTotalUsage()).toMatchObject({ input: 11, output: 5 });
+		expect(graph.getUsageAttributions()).toEqual([expect.objectContaining({ agentKind: "root" })]);
 	});
 
 	it("coalesces delegated completion into one event-driven synthesis resume", async () => {
@@ -884,13 +885,17 @@ describe("AgentSession rlm recursion", () => {
 		});
 		graph.startTask(childTask.id, childSessionManager.getSessionId());
 		const root = createSession({ sessionManager: rootSessionManager, taskGraph: graph, taskId: graph.rootTaskId });
+		const childStream = vi.fn((_model, context: Context) => streamAnswer(userText(context)));
 		const child = createSession({
 			sessionManager: childSessionManager,
 			taskGraph: graph,
 			taskId: childTask.id,
 			depth: 1,
+			streamFn: childStream,
 		});
 		root.registerRlmChildSession(childSessionManager.getSessionId(), child);
+		await child.prompt("Run the initial bounded review");
+		expect(childStream).toHaveBeenCalledTimes(1);
 		const rootHandlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
 		const childHandlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
 
@@ -930,6 +935,7 @@ describe("AgentSession rlm recursion", () => {
 				child.messages.filter((message) => message.role === "custom" && message.customType === "agent_task_resume")
 					.length === 1,
 		);
+		await waitFor(() => childStream.mock.calls.length === 2);
 		await expect(rootHandlers["rlm.task.defer_until_children_complete"]?.({})).resolves.toMatchObject({
 			state: "waiting",
 		});
@@ -2390,6 +2396,9 @@ describe("AgentSession rlm recursion", () => {
 		expect(after.cost).toBeGreaterThanOrEqual(before.cost + 10);
 		expect(graph.getTotalUsage().input).toBeGreaterThanOrEqual(7);
 		expect(graph.getTotalUsage().output).toBeGreaterThanOrEqual(3);
+		expect(graph.getUsageAttributions()).toEqual(
+			expect.arrayContaining([expect.objectContaining({ agentKind: "child" })]),
+		);
 		expect(parentAssistant.usage.totalTokens).toBe(0);
 
 		const parentEntry = root.sessionManager
