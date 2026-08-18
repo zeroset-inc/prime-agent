@@ -490,6 +490,8 @@ export interface AgentSessionConfig {
 	taskGraph?: AgentTaskGraph;
 	/** Task owned by this session inside taskGraph. */
 	taskId?: string;
+	/** Task charged for model usage when this session does not own a task. */
+	taskAccountingTaskId?: string;
 	/** Immutable actor identity authorized for task mutations in this session. */
 	taskActorId?: string;
 	/** Shared capacity acquired for every child turn, including retained follow-ups. */
@@ -1279,6 +1281,7 @@ export class AgentSession {
 	private _rlmParentAgent?: string;
 	private readonly _taskGraph?: AgentTaskGraph;
 	private readonly _taskId?: string;
+	private readonly _taskAccountingTaskId?: string;
 	private readonly _taskActorId?: string;
 	private readonly _turnCapacityPool?: RlmSubagentCapacityPool;
 	private readonly _taskAccountedAssistantMessages = new WeakSet<AssistantMessage>();
@@ -1404,6 +1407,7 @@ export class AgentSession {
 		this._rlmParentAgent = config.rlmParentAgent;
 		this._taskGraph = config.taskGraph;
 		this._taskId = config.taskId;
+		this._taskAccountingTaskId = config.taskAccountingTaskId ?? config.taskId;
 		this._taskActorId =
 			config.taskActorId ??
 			(this._taskGraph && this._taskId ? this._taskGraph.getTask(this._taskId).ownerAgentId : undefined);
@@ -3624,10 +3628,10 @@ export class AgentSession {
 	};
 
 	private _recordTaskUsage(usage: Usage): void {
-		if (!this._taskGraph || !this._taskId || !this._taskActorId) return;
+		if (!this._taskGraph || !this._taskAccountingTaskId) return;
 		try {
 			this._taskGraph.recordUsage(
-				this._taskId,
+				this._taskAccountingTaskId,
 				{
 					input: usage.input,
 					output: usage.output,
@@ -3635,7 +3639,7 @@ export class AgentSession {
 					cacheWrite: usage.cacheWrite,
 					cost: usage.cost.total,
 				},
-				this._taskActorId,
+				this._taskActorId ?? this.sessionId,
 			);
 			this._taskAccountingError = undefined;
 		} catch (error) {
@@ -9553,6 +9557,7 @@ export class AgentSession {
 		sessionDir: string;
 		model: Model<any>;
 		taskId?: string;
+		taskAccountingTaskId?: string;
 		taskActorId?: string;
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
@@ -9576,6 +9581,7 @@ export class AgentSession {
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
 			taskId: options.taskId,
+			taskAccountingTaskId: options.taskAccountingTaskId,
 			taskActorId: options.taskActorId,
 		};
 	}
@@ -9639,6 +9645,7 @@ export class AgentSession {
 			includeCompactSkill: options.includeCompactSkill,
 			taskGraph: this._taskGraph,
 			taskId: options.taskId,
+			taskAccountingTaskId: options.taskAccountingTaskId,
 			taskActorId: options.taskActorId,
 			turnCapacityPool: options.turnCapacityPool,
 			rlmDepth: options.rlmDepth,
@@ -10408,6 +10415,7 @@ export class AgentSession {
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
 				taskId: delegatedTaskId,
+				taskAccountingTaskId: delegatedTaskId ?? this._taskAccountingTaskId,
 				taskActorId: delegatedTaskId ? childNodeId : undefined,
 			}),
 			onSessionPublished: publishChildSession,
