@@ -563,6 +563,7 @@ export async function generateSummary(
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
+	reportUsage?: (usage: Usage) => void,
 ): Promise<string> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
@@ -598,6 +599,7 @@ export async function generateSummary(
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		completionOptions,
 	);
+	reportUsage?.(response.usage);
 
 	if (response.stopReason === "error") {
 		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
@@ -750,6 +752,7 @@ export async function compact(
 	customInstructions?: string,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	reportUsage?: (usage: Usage) => void,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -779,6 +782,7 @@ export async function compact(
 						customInstructions,
 						previousSummary,
 						thinkingLevel,
+						reportUsage,
 					)
 				: Promise.resolve("No prior history."),
 			generateTurnPrefixSummary(
@@ -789,6 +793,7 @@ export async function compact(
 				headers,
 				signal,
 				thinkingLevel,
+				reportUsage,
 			),
 		]);
 		// Merge into single summary
@@ -805,6 +810,7 @@ export async function compact(
 			customInstructions,
 			previousSummary,
 			thinkingLevel,
+			reportUsage,
 		);
 	}
 
@@ -835,6 +841,7 @@ async function generateTurnPrefixSummary(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	reportUsage?: (usage: Usage) => void,
 ): Promise<string> {
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 	const llmMessages = convertToLlm(messages);
@@ -855,6 +862,7 @@ async function generateTurnPrefixSummary(
 			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
 			: { maxTokens, signal, apiKey, headers },
 	);
+	reportUsage?.(response.usage);
 
 	if (response.stopReason === "error") {
 		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);

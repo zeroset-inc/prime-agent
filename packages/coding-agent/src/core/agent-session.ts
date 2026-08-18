@@ -490,6 +490,8 @@ export interface AgentSessionConfig {
 	taskGraph?: AgentTaskGraph;
 	/** Task owned by this session inside taskGraph. */
 	taskId?: string;
+	/** Task charged for model usage when this session does not own a task. */
+	taskAccountingTaskId?: string;
 	/** Immutable actor identity authorized for task mutations in this session. */
 	taskActorId?: string;
 	/** Shared capacity acquired for every child turn, including retained follow-ups. */
@@ -1279,8 +1281,10 @@ export class AgentSession {
 	private _rlmParentAgent?: string;
 	private readonly _taskGraph?: AgentTaskGraph;
 	private readonly _taskId?: string;
+	private readonly _taskAccountingTaskId?: string;
 	private readonly _taskActorId?: string;
 	private readonly _turnCapacityPool?: RlmSubagentCapacityPool;
+	private readonly _taskAccountedAssistantMessages = new WeakSet<AssistantMessage>();
 	private _taskAccountingError?: Error;
 	private _taskResumeDrain?: Promise<void>;
 	private _repliedToParentSinceTask: boolean | undefined;
@@ -1403,6 +1407,7 @@ export class AgentSession {
 		this._rlmParentAgent = config.rlmParentAgent;
 		this._taskGraph = config.taskGraph;
 		this._taskId = config.taskId;
+		this._taskAccountingTaskId = config.taskAccountingTaskId ?? config.taskId;
 		this._taskActorId =
 			config.taskActorId ??
 			(this._taskGraph && this._taskId ? this._taskGraph.getTask(this._taskId).ownerAgentId : undefined);
@@ -3555,28 +3560,10 @@ export class AgentSession {
 		if (
 			event.type === "message_end" &&
 			event.message.role === "assistant" &&
-			event.message.stopReason !== "error" &&
-			event.message.stopReason !== "aborted" &&
-			this._taskGraph &&
-			this._taskId &&
-			this._taskActorId
+			!this._taskAccountedAssistantMessages.has(event.message)
 		) {
-			try {
-				this._taskGraph.recordUsage(
-					this._taskId,
-					{
-						input: event.message.usage.input,
-						output: event.message.usage.output,
-						cacheRead: event.message.usage.cacheRead,
-						cacheWrite: event.message.usage.cacheWrite,
-						cost: event.message.usage.cost.total,
-					},
-					this._taskActorId,
-				);
-				this._taskAccountingError = undefined;
-			} catch (error) {
-				this._taskAccountingError = error instanceof Error ? error : new Error(String(error));
-			}
+			this._taskAccountedAssistantMessages.add(event.message);
+			this._recordTaskUsage(event.message.usage);
 		}
 		if (event.type === "message_start" || event.type === "message_end") {
 			for (const action of this._actionStore.ownedActions()) {
@@ -3639,6 +3626,26 @@ export class AgentSession {
 		);
 		this._agentEventQueue.catch(() => {});
 	};
+
+	private _recordTaskUsage(usage: Usage): void {
+		if (!this._taskGraph || !this._taskAccountingTaskId) return;
+		try {
+			this._taskGraph.recordUsage(
+				this._taskAccountingTaskId,
+				{
+					input: usage.input,
+					output: usage.output,
+					cacheRead: usage.cacheRead,
+					cacheWrite: usage.cacheWrite,
+					cost: usage.cost.total,
+				},
+				this._taskActorId ?? this.sessionId,
+			);
+			this._taskAccountingError = undefined;
+		} catch (error) {
+			this._taskAccountingError = error instanceof Error ? error : new Error(String(error));
+		}
+	}
 
 	private _createRetryPromiseForAgentEnd(event: AgentEvent): void {
 		if (event.type !== "agent_end" || this._retryPromise) {
@@ -7612,7 +7619,9 @@ export class AgentSession {
 
 		const { summary, firstKeptEntryId, tokensBefore, details } =
 			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
+			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel, (usage) =>
+				this._recordTaskUsage(usage),
+			));
 
 		if (signal.aborted) {
 			throw new Error("Compaction cancelled");
@@ -8073,6 +8082,7 @@ export class AgentSession {
 			headers,
 			signal,
 			this.thinkingLevel,
+			(usage) => this._recordTaskUsage(usage),
 		);
 	}
 
@@ -8284,6 +8294,7 @@ export class AgentSession {
 			headers,
 			signal,
 			this.thinkingLevel,
+			(usage) => this._recordTaskUsage(usage),
 		);
 		if (this._disposed || signal.aborted) {
 			throw new Error("Refinement cancelled because the session was disposed.");
@@ -9546,6 +9557,7 @@ export class AgentSession {
 		sessionDir: string;
 		model: Model<any>;
 		taskId?: string;
+		taskAccountingTaskId?: string;
 		taskActorId?: string;
 	}): CreateRlmSubagentRuntimeOptions {
 		return {
@@ -9569,6 +9581,7 @@ export class AgentSession {
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
 			taskId: options.taskId,
+			taskAccountingTaskId: options.taskAccountingTaskId,
 			taskActorId: options.taskActorId,
 		};
 	}
@@ -9632,6 +9645,7 @@ export class AgentSession {
 			includeCompactSkill: options.includeCompactSkill,
 			taskGraph: this._taskGraph,
 			taskId: options.taskId,
+			taskAccountingTaskId: options.taskAccountingTaskId,
 			taskActorId: options.taskActorId,
 			turnCapacityPool: options.turnCapacityPool,
 			rlmDepth: options.rlmDepth,
@@ -10401,6 +10415,7 @@ export class AgentSession {
 				sessionDir: childSessionDir,
 				model: modelSelection.model,
 				taskId: delegatedTaskId,
+				taskAccountingTaskId: delegatedTaskId ?? this._taskAccountingTaskId,
 				taskActorId: delegatedTaskId ? childNodeId : undefined,
 			}),
 			onSessionPublished: publishChildSession,
@@ -10458,31 +10473,29 @@ export class AgentSession {
 						emitChildUpdate();
 					} else if (event.type === "message_end" && event.message.role === "assistant") {
 						const assistant = event.message as AssistantMessage;
-						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
-							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
-							if (parentAssistantForUsage) {
-								const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
-								if (parentEntry) {
-									const messages = child.messages;
-									const assistantIndex = messages.lastIndexOf(assistant);
-									const precedingPrompt = messages
-										.slice(0, assistantIndex)
-										.reverse()
-										.find((message) => message.role === "user" || message.role === "custom");
-									const origin =
-										precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
-											? precedingPrompt.details.id.startsWith("spawn:")
-												? "spawn_task"
-												: "agent_message"
-											: "direct_user";
-									this.sessionManager.appendChildUsageAttribution(
-										parentEntry.id,
-										assistant.usage,
-										parentAssistantForUsage.usage,
-										origin,
-										childNodeId,
-									);
-								}
+						attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
+						if (parentAssistantForUsage) {
+							const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
+							if (parentEntry) {
+								const messages = child.messages;
+								const assistantIndex = messages.lastIndexOf(assistant);
+								const precedingPrompt = messages
+									.slice(0, assistantIndex)
+									.reverse()
+									.find((message) => message.role === "user" || message.role === "custom");
+								const origin =
+									precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
+										? precedingPrompt.details.id.startsWith("spawn:")
+											? "spawn_task"
+											: "agent_message"
+										: "direct_user";
+								this.sessionManager.appendChildUsageAttribution(
+									parentEntry.id,
+									assistant.usage,
+									parentAssistantForUsage.usage,
+									origin,
+									childNodeId,
+								);
 							}
 						}
 						const text = compactRlmText(readAssistantText(assistant));
@@ -11556,6 +11569,7 @@ export class AgentSession {
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
+					reportUsage: (usage) => this._recordTaskUsage(usage),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };

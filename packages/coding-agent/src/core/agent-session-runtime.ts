@@ -371,6 +371,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
 					taskGraph: options.parentSession.taskGraph,
 					taskId: options.taskId,
+					taskAccountingTaskId: options.taskAccountingTaskId,
 				},
 				runtimeMetadata: {
 					kind: "subagent",

@@ -773,6 +773,38 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("records provider-reported usage from an aborted task call", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "aborted-usage-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "aborted-usage-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+			},
+		});
+		const streamFn: StreamFn = () => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: { ...assistantMessage("cancelled", usage(11, 5)), stopReason: "aborted" },
+				});
+			});
+			return stream;
+		};
+		const root = createSession({
+			sessionManager,
+			streamFn,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+		});
+
+		await root.prompt("review");
+
+		expect(graph.getTotalUsage()).toMatchObject({ input: 11, output: 5 });
+	});
+
 	it("coalesces delegated completion into one event-driven synthesis resume", async () => {
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "coalesced-resume-sessions"));
 		const graph = AgentTaskGraph.open({
@@ -2334,7 +2366,15 @@ describe("AgentSession rlm recursion", () => {
 	});
 
 	it("adds child usage to the parent session aggregate", async () => {
-		const root = createSession();
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "usage-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "usage-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Coordinate general work",
+			},
+		});
+		const root = createSession({ sessionManager, taskGraph: graph, taskId: graph.rootTaskId });
 		const parentAssistant = assistantMessage("running ipython", usage(0, 0));
 		root.agent.state.messages.push(parentAssistant);
 		root.sessionManager.appendMessage(parentAssistant);
@@ -2348,6 +2388,8 @@ describe("AgentSession rlm recursion", () => {
 		expect(after.tokens.output).toBeGreaterThanOrEqual(before.tokens.output + 3);
 		expect(after.tokens.total).toBeGreaterThanOrEqual(before.tokens.total + 10);
 		expect(after.cost).toBeGreaterThanOrEqual(before.cost + 10);
+		expect(graph.getTotalUsage().input).toBeGreaterThanOrEqual(7);
+		expect(graph.getTotalUsage().output).toBeGreaterThanOrEqual(3);
 		expect(parentAssistant.usage.totalTokens).toBe(0);
 
 		const parentEntry = root.sessionManager

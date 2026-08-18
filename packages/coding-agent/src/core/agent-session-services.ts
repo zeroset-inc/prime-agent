@@ -83,6 +83,8 @@ export interface AgentSessionCreationOptions {
 	taskGraph?: AgentTaskGraph;
 	/** Task owned by this session inside taskGraph. */
 	taskId?: string;
+	/** Task charged for model usage when this session does not own a task. */
+	taskAccountingTaskId?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
 	prewarmIpythonKernel?: boolean;
@@ -302,6 +304,7 @@ export async function createAgentSessionFromServices(
 		rlmParentAgent: options.rlmParentAgent,
 		taskGraph: options.taskGraph,
 		taskId: options.taskId,
+		taskAccountingTaskId: options.taskAccountingTaskId,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		rlmHeartbeatController: options.rlmHeartbeatController,
 		sessionStartEvent: options.sessionStartEvent,

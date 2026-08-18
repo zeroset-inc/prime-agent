@@ -273,6 +273,8 @@ export interface CreateRlmSubagentRuntimeOptions {
 	rlmParentNodeId: string;
 	/** Durable task owned by this child when it was spawned through rlm.delegate. */
 	taskId?: string;
+	/** Durable task charged for this child's usage when it does not own one. */
+	taskAccountingTaskId?: string;
 	/** Immutable actor identity used to authorize this child's task operations. */
 	taskActorId?: string;
 	/** Shared execution capacity acquired for each child turn, including retained follow-ups. */

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed durable task usage omitting cancelled calls and internal refinement, compaction, and branch-summary model calls.
+
 ## [0.7.9] - 2026-08-18
 
 - Fixed blocked descendants leaving suspended supervisors idle instead of waking them for durable gap resolution.
