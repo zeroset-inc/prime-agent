@@ -120,6 +120,7 @@ export interface AgentTaskUsage {
 
 export interface AgentTaskUsageAttribution {
 	agentId: string;
+	agentKind?: "root" | "child";
 	model: string;
 	calls: number;
 	usage: AgentTaskUsage;
@@ -265,7 +266,7 @@ interface AgentTaskGraphEvent {
 	usageDelta?: {
 		taskId: string;
 		usage: AgentTaskUsage;
-		attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "model">;
+		attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "agentKind" | "model">;
 		taskVersion: number;
 		updatedAt: string;
 	};
@@ -903,7 +904,7 @@ export class AgentTaskGraph {
 		taskId: string,
 		usage: Partial<AgentTaskUsage>,
 		actorAgentId: string,
-		attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "model">,
+		attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "agentKind" | "model">,
 	): AgentTask {
 		const task = this.findTask(taskId);
 		const delta: AgentTaskUsage = {
@@ -913,12 +914,7 @@ export class AgentTaskGraph {
 			cacheWrite: normalizeUsageNumber(usage.cacheWrite),
 			cost: normalizeUsageNumber(usage.cost),
 		};
-		const normalizedAttribution = attribution
-			? {
-					agentId: normalizeIdentifier(attribution.agentId, "usage attribution agentId"),
-					model: normalizeText(attribution.model, "usage attribution model", 256),
-				}
-			: undefined;
+		const normalizedAttribution = normalizeUsageAttribution(attribution);
 		const next = addUsageDelta(task, delta, new Date().toISOString(), task.version + 1, normalizedAttribution);
 		this.commitUsage(actorAgentId, next, delta, normalizedAttribution);
 		return clone(next);
@@ -1137,6 +1133,7 @@ export class AgentTaskGraph {
 			if (event.usageDelta) {
 				const task = tasks.get(event.usageDelta.taskId);
 				if (!task) throw new AgentTaskGraphError(`usage event references unknown task: ${event.usageDelta.taskId}`);
+				const attribution = normalizeUsageAttribution(event.usageDelta.attribution);
 				tasks.set(
 					task.id,
 					addUsageDelta(
@@ -1144,7 +1141,7 @@ export class AgentTaskGraph {
 						event.usageDelta.usage,
 						event.usageDelta.updatedAt,
 						event.usageDelta.taskVersion,
-						event.usageDelta.attribution,
+						attribution,
 					),
 				);
 			}
@@ -1213,7 +1210,7 @@ export class AgentTaskGraph {
 		actorAgentId: string,
 		nextTask: AgentTask,
 		usage: AgentTaskUsage,
-		attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "model">,
+		attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "agentKind" | "model">,
 	): void {
 		this.assertWritable();
 		const version = this.state.version + 1;
@@ -1595,7 +1592,7 @@ function addUsageDelta(
 	delta: AgentTaskUsage,
 	updatedAt = new Date().toISOString(),
 	taskVersion = task.version + 1,
-	attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "model">,
+	attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "agentKind" | "model">,
 ): AgentTask {
 	const usageAttributions = [...(task.usageAttributions ?? [])];
 	if (attribution) {
@@ -1631,7 +1628,29 @@ function addUsage(current: AgentTaskUsage, delta: AgentTaskUsage): AgentTaskUsag
 }
 
 function normalizeUsageAttributions(task: AgentTask): AgentTask {
-	return { ...task, usageAttributions: Array.isArray(task.usageAttributions) ? task.usageAttributions : [] };
+	return {
+		...task,
+		usageAttributions: Array.isArray(task.usageAttributions)
+			? task.usageAttributions.map((attribution) => ({
+					...attribution,
+					...normalizeUsageAttribution(attribution),
+				}))
+			: [],
+	};
+}
+
+function normalizeUsageAttribution(
+	attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "agentKind" | "model">,
+): Pick<AgentTaskUsageAttribution, "agentId" | "agentKind" | "model"> | undefined {
+	if (!attribution) return undefined;
+	if (attribution.agentKind !== undefined && attribution.agentKind !== "root" && attribution.agentKind !== "child") {
+		throw new AgentTaskGraphError(`unsupported usage attribution agent kind: ${attribution.agentKind}`);
+	}
+	return {
+		agentId: normalizeIdentifier(attribution.agentId, "usage attribution agentId"),
+		...(attribution.agentKind ? { agentKind: attribution.agentKind } : {}),
+		model: normalizeText(attribution.model, "usage attribution model", 256),
+	};
 }
 
 function boundedRuntimeText(value: string, fallback: string): string {

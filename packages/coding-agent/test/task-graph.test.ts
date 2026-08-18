@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -509,6 +509,7 @@ describe("AgentTaskGraph", () => {
 		const graph = open();
 		graph.recordUsage(graph.rootTaskId, { input: 10, output: 3, cacheRead: 4, cost: 0.25 }, "root-agent", {
 			agentId: "root-agent",
+			agentKind: "root",
 			model: "zero/swe-root",
 		});
 		expect(graph.getTotalUsage()).toEqual({
@@ -522,6 +523,7 @@ describe("AgentTaskGraph", () => {
 			{
 				taskId: graph.rootTaskId,
 				agentId: "root-agent",
+				agentKind: "root",
 				model: "zero/swe-root",
 				calls: 1,
 				usage: { input: 10, output: 3, cacheRead: 4, cacheWrite: 0, cost: 0.25 },
@@ -546,6 +548,32 @@ describe("AgentTaskGraph", () => {
 		expect(restored.getUsageAttributions()).toEqual(graph.getUsageAttributions());
 		restored.checkpoint();
 		expect(readFileSync(join(directory!, "task-graph.events.jsonl"), "utf8")).toBe("");
+	});
+
+	it("rejects invalid attribution roles while replaying the durable journal", () => {
+		const graph = open();
+		graph.recordUsage(graph.rootTaskId, { input: 1 }, "root-agent", {
+			agentId: "root-agent",
+			agentKind: "root",
+			model: "zero/swe-root",
+		});
+		const eventsPath = join(directory!, "task-graph.events.jsonl");
+		const events = readFileSync(eventsPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		const usageEvent = events.find((event) => event.usageDelta);
+		if (!usageEvent) throw new Error("missing usage event");
+		usageEvent.usageDelta.attribution.agentKind = "coordinator";
+		writeFileSync(eventsPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`);
+
+		expect(() =>
+			AgentTaskGraph.open({
+				directory: directory!,
+				root: { ownerAgentId: "root-agent", objective: "Review the change" },
+				policy: { requireExclusiveClaims: true },
+			}),
+		).toThrow(/unsupported usage attribution agent kind/);
 	});
 
 	it("recovers an active recursive subtree once without resurrecting its coordinator", () => {
