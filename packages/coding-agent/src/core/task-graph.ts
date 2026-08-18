@@ -907,6 +907,19 @@ export class AgentTaskGraph {
 		return clone(next);
 	}
 
+	getTotalUsage(): AgentTaskUsage {
+		return this.state.tasks.reduce<AgentTaskUsage>(
+			(total, task) => ({
+				input: total.input + task.usage.input,
+				output: total.output + task.usage.output,
+				cacheRead: total.cacheRead + task.usage.cacheRead,
+				cacheWrite: total.cacheWrite + task.usage.cacheWrite,
+				cost: total.cost + task.usage.cost,
+			}),
+			{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+		);
+	}
+
 	assertTreeComplete(): void {
 		const unfinished = this.state.tasks.filter((task) => ACTIVE_TASK_STATUSES.has(task.status));
 		if (unfinished.length > 0) {

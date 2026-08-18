@@ -508,6 +508,13 @@ describe("AgentTaskGraph", () => {
 	it("replays compact usage deltas and checkpoints them into the snapshot", () => {
 		const graph = open();
 		graph.recordUsage(graph.rootTaskId, { input: 10, output: 3, cacheRead: 4, cost: 0.25 }, "root-agent");
+		expect(graph.getTotalUsage()).toEqual({
+			input: 10,
+			output: 3,
+			cacheRead: 4,
+			cacheWrite: 0,
+			cost: 0.25,
+		});
 		const journal = readFileSync(join(directory!, "task-graph.events.jsonl"), "utf8");
 		expect(journal).toContain('"usageDelta"');
 		expect(journal).toContain('"tasks":[]');
@@ -523,6 +530,7 @@ describe("AgentTaskGraph", () => {
 			cacheRead: 4,
 			cost: 0.25,
 		});
+		expect(restored.getTotalUsage()).toEqual(graph.getTotalUsage());
 		restored.checkpoint();
 		expect(readFileSync(join(directory!, "task-graph.events.jsonl"), "utf8")).toBe("");
 	});

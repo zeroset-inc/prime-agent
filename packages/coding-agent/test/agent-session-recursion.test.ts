@@ -773,6 +773,38 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("records provider-reported usage from an aborted task call", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "aborted-usage-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "aborted-usage-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+			},
+		});
+		const streamFn: StreamFn = () => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({
+					type: "done",
+					reason: "stop",
+					message: { ...assistantMessage("cancelled", usage(11, 5)), stopReason: "aborted" },
+				});
+			});
+			return stream;
+		};
+		const root = createSession({
+			sessionManager,
+			streamFn,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+		});
+
+		await root.prompt("review");
+
+		expect(graph.getTotalUsage()).toMatchObject({ input: 11, output: 5 });
+	});
+
 	it("coalesces delegated completion into one event-driven synthesis resume", async () => {
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "coalesced-resume-sessions"));
 		const graph = AgentTaskGraph.open({
