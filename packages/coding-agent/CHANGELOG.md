@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added durable per-task model-call attribution across root, delegated, replacement, and uncontracted agents.
 - Fixed durable task usage omitting cancelled calls and internal refinement, compaction, and branch-summary model calls.
 
 ## [0.7.9] - 2026-08-18

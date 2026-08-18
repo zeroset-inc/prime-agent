@@ -3630,6 +3630,7 @@ export class AgentSession {
 	private _recordTaskUsage(usage: Usage): void {
 		if (!this._taskGraph || !this._taskAccountingTaskId) return;
 		try {
+			const model = this.model;
 			this._taskGraph.recordUsage(
 				this._taskAccountingTaskId,
 				{
@@ -3640,6 +3641,7 @@ export class AgentSession {
 					cost: usage.cost.total,
 				},
 				this._taskActorId ?? this.sessionId,
+				model ? { agentId: this.sessionId, model: `${model.provider}/${model.id}` } : undefined,
 			);
 			this._taskAccountingError = undefined;
 		} catch (error) {
