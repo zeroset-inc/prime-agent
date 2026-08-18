@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-08-18
+
 ## [0.7.9] - 2026-08-18
 
 - Fixed Cloudflare AI Gateway model generation to preserve provider-native Anthropic IDs when upstream catalog display IDs use dotted versions.
