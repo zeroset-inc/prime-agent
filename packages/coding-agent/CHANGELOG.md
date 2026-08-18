@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.11] - 2026-08-18
+
 - Added stable root/child roles to durable model-usage attribution so session replacement cannot relabel historical root calls as child work.
 
 ## [0.7.10] - 2026-08-18
