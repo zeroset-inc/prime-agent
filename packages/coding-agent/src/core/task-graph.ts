@@ -118,6 +118,13 @@ export interface AgentTaskUsage {
 	cost: number;
 }
 
+export interface AgentTaskUsageAttribution {
+	agentId: string;
+	model: string;
+	calls: number;
+	usage: AgentTaskUsage;
+}
+
 export interface AgentTask {
 	id: string;
 	parentTaskId?: string;
@@ -142,6 +149,7 @@ export interface AgentTask {
 	gaps: AgentTaskGap[];
 	resumeRequest?: AgentTaskResumeRequest;
 	usage: AgentTaskUsage;
+	usageAttributions: AgentTaskUsageAttribution[];
 	childAgentId?: string;
 	reclaimedAt?: string;
 	version: number;
@@ -254,7 +262,13 @@ interface AgentTaskGraphEvent {
 	taskIds: string[];
 	tasks: AgentTask[];
 	rootAgentId?: string;
-	usageDelta?: { taskId: string; usage: AgentTaskUsage; taskVersion: number; updatedAt: string };
+	usageDelta?: {
+		taskId: string;
+		usage: AgentTaskUsage;
+		attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "model">;
+		taskVersion: number;
+		updatedAt: string;
+	};
 	at: string;
 }
 
@@ -638,6 +652,7 @@ export class AgentTaskGraph {
 			delegationState: "retained",
 			gaps: [],
 			usage: emptyUsage(),
+			usageAttributions: [],
 			childAgentId: input.childAgentId,
 			version: 1,
 			createdAt: now,
@@ -884,7 +899,12 @@ export class AgentTaskGraph {
 		return clone(next);
 	}
 
-	recordUsage(taskId: string, usage: Partial<AgentTaskUsage>, actorAgentId: string): AgentTask {
+	recordUsage(
+		taskId: string,
+		usage: Partial<AgentTaskUsage>,
+		actorAgentId: string,
+		attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "model">,
+	): AgentTask {
 		const task = this.findTask(taskId);
 		const delta: AgentTaskUsage = {
 			input: normalizeUsageNumber(usage.input),
@@ -893,17 +913,14 @@ export class AgentTaskGraph {
 			cacheWrite: normalizeUsageNumber(usage.cacheWrite),
 			cost: normalizeUsageNumber(usage.cost),
 		};
-		const next = touchTask({
-			...task,
-			usage: {
-				input: task.usage.input + delta.input,
-				output: task.usage.output + delta.output,
-				cacheRead: task.usage.cacheRead + delta.cacheRead,
-				cacheWrite: task.usage.cacheWrite + delta.cacheWrite,
-				cost: task.usage.cost + delta.cost,
-			},
-		});
-		this.commitUsage(actorAgentId, next, delta);
+		const normalizedAttribution = attribution
+			? {
+					agentId: normalizeIdentifier(attribution.agentId, "usage attribution agentId"),
+					model: normalizeText(attribution.model, "usage attribution model", 256),
+				}
+			: undefined;
+		const next = addUsageDelta(task, delta, new Date().toISOString(), task.version + 1, normalizedAttribution);
+		this.commitUsage(actorAgentId, next, delta, normalizedAttribution);
 		return clone(next);
 	}
 
@@ -917,6 +934,15 @@ export class AgentTaskGraph {
 				cost: total.cost + task.usage.cost,
 			}),
 			{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+		);
+	}
+
+	getUsageAttributions(): Array<AgentTaskUsageAttribution & { taskId: string }> {
+		return this.state.tasks.flatMap((task) =>
+			(task.usageAttributions ?? []).map((attribution) => ({
+				...clone(attribution),
+				taskId: task.id,
+			})),
 		);
 	}
 
@@ -1007,6 +1033,7 @@ export class AgentTaskGraph {
 			delegationState: "retained",
 			gaps: [],
 			usage: emptyUsage(),
+			usageAttributions: [],
 			version: 1,
 			createdAt: now,
 			updatedAt: now,
@@ -1106,13 +1133,19 @@ export class AgentTaskGraph {
 			}
 			if (event.graphId !== state.graphId || event.graphVersion <= state.version) continue;
 			const tasks = new Map(state.tasks.map((task) => [task.id, task]));
-			for (const task of event.tasks) tasks.set(task.id, task);
+			for (const task of event.tasks) tasks.set(task.id, normalizeUsageAttributions(task));
 			if (event.usageDelta) {
 				const task = tasks.get(event.usageDelta.taskId);
 				if (!task) throw new AgentTaskGraphError(`usage event references unknown task: ${event.usageDelta.taskId}`);
 				tasks.set(
 					task.id,
-					addUsageDelta(task, event.usageDelta.usage, event.usageDelta.updatedAt, event.usageDelta.taskVersion),
+					addUsageDelta(
+						task,
+						event.usageDelta.usage,
+						event.usageDelta.updatedAt,
+						event.usageDelta.taskVersion,
+						event.usageDelta.attribution,
+					),
 				);
 			}
 			state = {
@@ -1176,7 +1209,12 @@ export class AgentTaskGraph {
 		this.notifyChangeWaiters();
 	}
 
-	private commitUsage(actorAgentId: string, nextTask: AgentTask, usage: AgentTaskUsage): void {
+	private commitUsage(
+		actorAgentId: string,
+		nextTask: AgentTask,
+		usage: AgentTaskUsage,
+		attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "model">,
+	): void {
 		this.assertWritable();
 		const version = this.state.version + 1;
 		const tasks = new Map(this.state.tasks.map((task) => [task.id, task]));
@@ -1193,6 +1231,7 @@ export class AgentTaskGraph {
 			usageDelta: {
 				taskId: nextTask.id,
 				usage,
+				...(attribution ? { attribution } : {}),
 				taskVersion: nextTask.version,
 				updatedAt: nextTask.updatedAt,
 			},
@@ -1556,19 +1595,43 @@ function addUsageDelta(
 	delta: AgentTaskUsage,
 	updatedAt = new Date().toISOString(),
 	taskVersion = task.version + 1,
+	attribution?: Pick<AgentTaskUsageAttribution, "agentId" | "model">,
 ): AgentTask {
+	const usageAttributions = [...(task.usageAttributions ?? [])];
+	if (attribution) {
+		const index = usageAttributions.findIndex(
+			(candidate) => candidate.agentId === attribution.agentId && candidate.model === attribution.model,
+		);
+		const current = index >= 0 ? usageAttributions[index]! : undefined;
+		const next: AgentTaskUsageAttribution = {
+			...attribution,
+			calls: (current?.calls ?? 0) + 1,
+			usage: addUsage(current?.usage ?? emptyUsage(), delta),
+		};
+		if (index >= 0) usageAttributions[index] = next;
+		else usageAttributions.push(next);
+	}
 	return {
 		...task,
-		usage: {
-			input: task.usage.input + delta.input,
-			output: task.usage.output + delta.output,
-			cacheRead: task.usage.cacheRead + delta.cacheRead,
-			cacheWrite: task.usage.cacheWrite + delta.cacheWrite,
-			cost: task.usage.cost + delta.cost,
-		},
+		usage: addUsage(task.usage, delta),
+		usageAttributions,
 		version: taskVersion,
 		updatedAt,
 	};
+}
+
+function addUsage(current: AgentTaskUsage, delta: AgentTaskUsage): AgentTaskUsage {
+	return {
+		input: current.input + delta.input,
+		output: current.output + delta.output,
+		cacheRead: current.cacheRead + delta.cacheRead,
+		cacheWrite: current.cacheWrite + delta.cacheWrite,
+		cost: current.cost + delta.cost,
+	};
+}
+
+function normalizeUsageAttributions(task: AgentTask): AgentTask {
+	return { ...task, usageAttributions: Array.isArray(task.usageAttributions) ? task.usageAttributions : [] };
 }
 
 function boundedRuntimeText(value: string, fallback: string): string {
@@ -1663,7 +1726,10 @@ function parseSnapshot(raw: string): AgentTaskGraphSnapshot {
 	if (!Number.isInteger(snapshot.version) || !Array.isArray(snapshot.tasks)) {
 		throw new AgentTaskGraphError("task graph snapshot is missing version or tasks");
 	}
-	return clone(snapshot as AgentTaskGraphSnapshot);
+	return clone({
+		...(snapshot as AgentTaskGraphSnapshot),
+		tasks: (snapshot.tasks as AgentTask[]).map(normalizeUsageAttributions),
+	});
 }
 
 function assertJsonSize(value: unknown, field: string, maximum: number): void {
