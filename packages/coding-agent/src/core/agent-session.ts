@@ -10602,10 +10602,10 @@ export class AgentSession {
 						toolCallsSinceConvergenceBoundary += 1;
 						emitChildUpdate();
 					} else if (event.type === "turn_end") {
-						if (delegatedTaskId && this._taskGraph) {
-							const task = this._taskGraph.getTask(delegatedTaskId);
-							if (task.status === "running" && task.ownerAgentId === childNodeId) {
-								try {
+						try {
+							if (delegatedTaskId && this._taskGraph) {
+								const task = this._taskGraph.getTask(delegatedTaskId);
+								if (task.status === "running" && task.ownerAgentId === childNodeId) {
 									const convergence = this._taskGraph.recordDelegatedTaskConvergenceTurn(
 										delegatedTaskId,
 										childNodeId,
@@ -10623,13 +10623,14 @@ export class AgentSession {
 										this._taskGraph.interruptTask(delegatedTaskId, childNodeId, run.error);
 										child.requestAbort();
 									}
-								} catch (error) {
-									run.error = error instanceof Error ? error.message : String(error);
-									child.requestAbort();
 								}
 							}
+						} catch (error) {
+							run.error = error instanceof Error ? error.message : String(error);
+							child.requestAbort();
+						} finally {
+							toolCallsSinceConvergenceBoundary = 0;
 						}
-						toolCallsSinceConvergenceBoundary = 0;
 						emitChildUpdate();
 					} else if (event.type === "session_info_changed" || event.type === "recap_update") {
 						emitChildUpdate();

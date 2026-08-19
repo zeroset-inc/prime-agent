@@ -3,9 +3,10 @@
 ## [Unreleased]
 
 - Added durable graph-scoped delegated-task convergence with an absolute exploration ceiling that survives task reassignment and recovery.
-- Added a structured-completion correction that host-preserves the rejected conclusion and durable evidence while allowing at most three task-action attempts in one bounded turn.
-- Added a graph-scoped inspection-only profile for every recursive task session's IPython kernel that fails closed unless supported Linux seccomp enforcement can deny external process execution plus ptrace and process_vm_* memory access.
-- Changed malformed task-graph policies to fail before creating durable graph state.
+- Added a structured-completion correction that host-preserves the rejected conclusion and durable evidence, permits validators to reject only mutable structured fields, and allows at most three task-action attempts in one bounded turn.
+- Added a graph-scoped Linux task-kernel execution profile that fails closed unless seccomp can block execve/execveat and ptrace/process_vm_* cross-process memory syscalls.
+- Added an immutable task-graph capability contract for hosts to negotiate execution-profile, completion-correction, and convergence support.
+- Changed malformed task-graph policies, including policies with unknown or misspelled keys, to fail before creating durable graph state.
 - Fixed task progress updates dropping previously recorded durable evidence or completed questions when later updates omitted those optional fields.
 - Fixed task resume and orchestration-control model turns being attributed as direct user work instead of task-owned usage.
 

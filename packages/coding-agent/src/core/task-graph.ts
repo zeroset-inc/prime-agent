@@ -10,6 +10,7 @@ export const AGENT_TASK_RESULT_MAX_BYTES = 64 * 1024;
 export const AGENT_TASK_SNAPSHOT_PAGE_MAX_ITEMS = 100;
 export const AGENT_TASK_SNAPSHOT_COMPACT_EVENT_THRESHOLD = 128;
 export const AGENT_TASK_SNAPSHOT_COMPACT_BYTE_THRESHOLD = 512 * 1024;
+/** Immutable runtime capability advertisement for hosts that configure task-graph policies. */
 export const AGENT_TASK_GRAPH_POLICY_CAPABILITIES = Object.freeze({
 	version: 2,
 	graphScopedExecutionProfile: true,
@@ -282,11 +283,11 @@ export interface AgentTaskGraphPolicy {
 	 * policy used with correction must not reject or require changes to summary;
 	 * it may reject only fields the correction turn is allowed to supply. */
 	delegatedTaskCompletionCorrection?: boolean;
-	/** Applies an inspection-only profile to every task session's IPython
-	 * kernel. In-process Python remains available, but external process
-	 * creation and execution are denied, along with ptrace and process_vm_*
-	 * cross-process memory syscalls. This is an execution profile, not a
-	 * complete hostile-process sandbox.
+	/** Applies a restricted Linux execution profile to every task session's
+	 * IPython kernel. In-process Python, including file writes, remains available.
+	 * Seccomp blocks execve/execveat and ptrace/process_vm_* cross-process memory
+	 * syscalls, while a Python audit hook rejects conventional process-creation
+	 * APIs. This is an execution profile, not a complete hostile-process sandbox.
 	 * Kernel startup fails closed unless supported Linux seccomp enforcement
 	 * can be installed. Other host and extension execution surfaces are outside
 	 * this profile. */
