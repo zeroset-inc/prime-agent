@@ -9,6 +9,9 @@ dependencies = [
   "tyro",
 ]
 
+[dependency-groups]
+test = ["httpx", "mcp"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

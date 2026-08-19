@@ -1,14 +1,38 @@
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { cleanupSessionResources } from "@earendil-works/pi-ai";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "../src/core/extensions/types.js";
 import type { KernelBootstrapProgressHandler } from "../src/core/kernel/bootstrap.js";
 import { type ExecuteResult, KernelBusyAfterInterruptError, KernelManager } from "../src/core/kernel/index.js";
-import { createIpythonToolDefinition, IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
+import {
+	buildRlmBootstrapCode,
+	createIpythonToolDefinition,
+	IpythonKernelProvisioner,
+} from "../src/core/tools/ipython.js";
 
 let tempDir = "";
+const testDir = dirname(fileURLToPath(import.meta.url));
+const runtimeSourceDir = join(testDir, "..", "..", "..", "prime-agent-runtime", "src");
+
+function resolveKernelPython(): string | null {
+	const candidates = [
+		process.env.PRIME_AGENT_KERNEL_PYTHON,
+		join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python"),
+		"python3",
+	].filter((candidate): candidate is string => Boolean(candidate));
+	for (const candidate of candidates) {
+		if (candidate.includes("/") && !existsSync(candidate)) continue;
+		const check = spawnSync(candidate, ["-c", "import ipykernel"], { encoding: "utf8" });
+		if (check.status === 0) return candidate;
+	}
+	return null;
+}
+
+const inspectionKernelPython = process.platform === "linux" ? resolveKernelPython() : null;
 
 // These tests count spawns of a stub python; the default-on forkserver adds an
 // extra spawn + ready handshake the stub never answers, so pin direct-spawn.
@@ -338,6 +362,77 @@ describe("IpythonKernelProvisioner", () => {
 
 		expect(existsSync(dill)).toBe(true);
 		expect(existsSync(manifest)).toBe(true);
+	});
+
+	it.skipIf(inspectionKernelPython === null)(
+		"enforces the inspection profile across pre-existing kernel threads",
+		async () => {
+			const provisioner = new IpythonKernelProvisioner(tempDir, {
+				python: inspectionKernelPython as string,
+				env: { PYTHONPATH: runtimeSourceDir },
+				executionProfile: "inspection_only",
+				snapshotDir: join(tempDir, "snapshot"),
+			});
+			try {
+				const manager = await provisioner.ensure();
+				const result = await manager.execute(
+					[
+						"import ctypes, errno, os, platform, threading",
+						"assert callable(rlm)",
+						"probe_done = threading.Event()",
+						"probe_result = []",
+						"def probe_preexisting_thread():",
+						"    libc = ctypes.CDLL(None, use_errno=True)",
+						"    libc.execve.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_char_p)]",
+						"    libc.execve.restype = ctypes.c_int",
+						"    argv = (ctypes.c_char_p * 2)(b'/prime-agent-missing', None)",
+						"    envp = (ctypes.c_char_p * 1)(None)",
+						"    ctypes.set_errno(0)",
+						"    probe_result.append((libc.execve(b'/prime-agent-missing', argv, envp), ctypes.get_errno()))",
+						"    probe_done.set()",
+						"iopub_thread = get_ipython().kernel.iopub_thread",
+						"assert iopub_thread.thread.is_alive()",
+						"iopub_thread.schedule(probe_preexisting_thread)",
+						"assert probe_done.wait(5)",
+						"assert probe_result == [(-1, errno.EPERM)]",
+						"try:",
+						"    os.system('true')",
+						"except PermissionError:",
+						"    pass",
+						"else:",
+						"    raise AssertionError('Python audit hook allowed os.system')",
+						"if platform.machine().lower() in ('x86_64', 'amd64'):",
+						"    libc = ctypes.CDLL(None, use_errno=True)",
+						"    libc.syscall.argtypes = [ctypes.c_long]",
+						"    libc.syscall.restype = ctypes.c_long",
+						"    ctypes.set_errno(0)",
+						"    assert libc.syscall(0x40000027) == -1",
+						"    assert ctypes.get_errno() == errno.EPERM",
+						"print('inspection-enforced')",
+					].join("\n"),
+				);
+				expect(result.status, result.error?.traceback.join("\n")).toBe("ok");
+				expect(result.stdout).toContain("inspection-enforced");
+			} finally {
+				await provisioner.dispose();
+			}
+		},
+		60_000,
+	);
+
+	it("leaves general Python runtimes unrestricted", () => {
+		const bootstrap = buildRlmBootstrapCode([]);
+		const script = [
+			"class _PrimeTestIpython:",
+			"    colors = None",
+			"def get_ipython():",
+			"    return _PrimeTestIpython()",
+			bootstrap,
+			"import subprocess",
+			"subprocess.run(['true'], check=True)",
+		].join("\n");
+		const result = spawnSync("python3", ["-c", script], { cwd: tempDir, encoding: "utf8" });
+		expect(result.status, result.stderr).toBe(0);
 	});
 });
 
