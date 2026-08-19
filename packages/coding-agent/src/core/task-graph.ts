@@ -277,13 +277,19 @@ export interface AgentTaskGraphPolicy {
 	};
 	/** Opts delegated tasks into one correction turn after an automatic
 	 * completion fails host validation. The correction must explicitly submit
-	 * a structured result or report a gap. */
+	 * a structured result or report a gap within three action attempts. Prime
+	 * preserves the automatic completion's summary, so a validateCompletion
+	 * policy used with correction must not reject or require changes to summary;
+	 * it may reject only fields the correction turn is allowed to supply. */
 	delegatedTaskCompletionCorrection?: boolean;
 	/** Applies an inspection-only profile to every task session's IPython
 	 * kernel. In-process Python remains available, but external process
-	 * creation and execution are denied. Kernel startup fails closed unless
-	 * supported Linux seccomp enforcement can be installed. Other host and
-	 * extension execution surfaces are outside this profile. */
+	 * creation and execution are denied, along with ptrace and process_vm_*
+	 * cross-process memory syscalls. This is an execution profile, not a
+	 * complete hostile-process sandbox.
+	 * Kernel startup fails closed unless supported Linux seccomp enforcement
+	 * can be installed. Other host and extension execution surfaces are outside
+	 * this profile. */
 	executionProfile?: "inspection_only";
 }
 

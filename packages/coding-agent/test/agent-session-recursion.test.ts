@@ -1029,6 +1029,91 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("interrupts a summary-rejecting completion correction after three action attempts", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "completion-attempt-limit-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "completion-attempt-limit-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: {
+				requireExclusiveClaims: true,
+				delegatedTaskCompletionCorrection: true,
+				validateCompletion: ({ task, result }) => {
+					if (task.parentTaskId && result.summary === "immutable conclusion") {
+						throw new AgentTaskGraphError("summary must be rewritten");
+					}
+				},
+			},
+		});
+		const correctionErrors: string[] = [];
+		let root: AgentSession;
+		root = createSession({
+			sessionManager,
+			maxDepth: 2,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+			streamFn: (_model, context) => {
+				const rawContent = (context.messages[context.messages.length - 1] as { content?: unknown } | undefined)
+					?.content;
+				const prompt = userText(context) || (typeof rawContent === "string" ? rawContent : "");
+				if (!prompt.includes("[task completion correction]")) return streamAnswer("immutable conclusion");
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(async () => {
+					const child = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0]?.session;
+					if (!child) throw new Error("expected an active delegated child session");
+					const handlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
+					for (let attempt = 0; attempt < 3; attempt += 1) {
+						try {
+							await handlers["rlm.task.complete"]?.(
+								attempt === 0
+									? {}
+									: {
+											result: {
+												summary: `rewrite ${attempt + 1}`,
+												verification: [],
+												candidateFindings: [],
+												unresolvedQuestions: [],
+												coverageGaps: [],
+												evidenceRefs: [],
+											},
+										},
+							);
+						} catch (error) {
+							correctionErrors.push(error instanceof Error ? error.message : String(error));
+						}
+					}
+				});
+				return stream;
+			},
+		});
+
+		const spawned = await root.delegateRlmChild("Review runtime", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			delegationReason: "Independent runtime boundary",
+		});
+
+		await waitFor(() => graph.getTask(spawned.task_id!).status === "interrupted");
+		expect(correctionErrors).toEqual([
+			"result must be an object",
+			"summary must be rewritten",
+			"summary must be rewritten",
+		]);
+		const failure = (root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(spawned.rlm_child_id)?.failure;
+		expect(failure?.cause).toBeInstanceOf(AggregateError);
+		expect((failure?.cause as AggregateError).errors.map((error) => (error as Error).message)).toEqual([
+			"summary must be rewritten",
+			"summary must be rewritten",
+		]);
+	});
+
 	it("retains both automatic-completion and correction failures in the child failure cause", async () => {
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "completion-cause-sessions"));
 		const graph = AgentTaskGraph.open({

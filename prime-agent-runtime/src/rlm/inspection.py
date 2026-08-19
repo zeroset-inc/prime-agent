@@ -14,14 +14,27 @@ class _Architecture:
     audit_arch: int
     seccomp_syscall: int
     exec_syscalls: tuple[int, ...]
+    cross_process_syscalls: tuple[int, ...]
     rejects_x32: bool = False
 
 
 _ARCHITECTURES = {
-    "x86_64": _Architecture(0xC000003E, 317, (59, 322), rejects_x32=True),
-    "amd64": _Architecture(0xC000003E, 317, (59, 322), rejects_x32=True),
-    "aarch64": _Architecture(0xC00000B7, 277, (221, 281)),
-    "arm64": _Architecture(0xC00000B7, 277, (221, 281)),
+    "x86_64": _Architecture(
+        0xC000003E,
+        317,
+        (59, 322),
+        (101, 310, 311),
+        rejects_x32=True,
+    ),
+    "amd64": _Architecture(
+        0xC000003E,
+        317,
+        (59, 322),
+        (101, 310, 311),
+        rejects_x32=True,
+    ),
+    "aarch64": _Architecture(0xC00000B7, 277, (221, 281), (117, 270, 271)),
+    "arm64": _Architecture(0xC00000B7, 277, (221, 281), (117, 270, 271)),
 }
 
 _BPF_LD_W_ABS = 0x20
@@ -82,7 +95,10 @@ def _filter_values(architecture: _Architecture) -> list[tuple[int, int, int, int
                 (_BPF_RET_K, 0, 0, deny),
             ]
         )
-    for syscall_number in architecture.exec_syscalls:
+    for syscall_number in (
+        *architecture.exec_syscalls,
+        *architecture.cross_process_syscalls,
+    ):
         values.extend(
             [
                 (_BPF_JMP_JEQ_K, 0, 1, syscall_number),
@@ -168,7 +184,7 @@ def _install_audit_hook() -> None:
 
 
 def enforce_inspection_only() -> None:
-    """Deny external process execution in this interpreter and all its threads."""
+    """Deny process execution and cross-process memory access in all threads."""
     global _enforced
     if _enforced:
         return

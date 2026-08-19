@@ -274,9 +274,17 @@ import {
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import {
-	type AgentTask,
+	AGENT_TASK_COMPLETION_CORRECTION_MAX_ATTEMPTS,
+	type AgentTaskCompletionCorrection,
+	beginTaskCompletionCorrectionAction,
+	completeTaskCompletionCorrectionAction,
+	constrainTaskCompletionCorrectionResult,
+	createTaskCompletionCorrection,
+	recordTaskCompletionCorrectionFailure,
+	taskCompletionCorrectionFailure,
+} from "./task-completion-correction.js";
+import {
 	type AgentTaskDelegationInput,
-	type AgentTaskGap,
 	type AgentTaskGraph,
 	AgentTaskGraphError,
 	type AgentTaskResult,
@@ -1011,15 +1019,6 @@ interface AgentTaskControlMessageDetails {
 	kind: "convergence" | "completion_correction";
 }
 
-interface AgentTaskCompletionCorrectionConstraint {
-	taskId: string;
-	hostSummary: string;
-	requiredEvidenceRefs: readonly string[];
-	initialError: Error;
-	lastAttemptError?: Error;
-	actionCompleted: boolean;
-}
-
 function createAgentTaskControlMessage(
 	taskId: string,
 	kind: AgentTaskControlMessageDetails["kind"],
@@ -1035,37 +1034,12 @@ function createAgentTaskControlMessage(
 	};
 }
 
-function stableStringUnion(left: readonly string[], right: readonly string[]): string[] {
-	const merged: string[] = [];
-	const seen = new Set<string>();
-	for (const value of [...left, ...right]) {
-		if (seen.has(value)) continue;
-		seen.add(value);
-		merged.push(value);
-	}
-	return merged;
-}
-
 function delegatedTaskConvergenceDirective(remainingToolCalls?: number): string {
 	const allowance =
 		remainingToolCalls === undefined
 			? ""
 			: ` You have ${remainingToolCalls} remaining tool call${remainingToolCalls === 1 ? "" : "s"} in finalization.`;
 	return `You have reached this task's evidence-convergence boundary.${allowance} Stop broad exploration now. Record supported evidence with rlm.task.update, then submit the bounded structured conclusion. Report a precise gap if the task cannot be completed.`;
-}
-
-function taskCompletionCorrectionFailure(
-	taskId: string,
-	initialError: Error,
-	correctionError: unknown,
-): AgentTaskGraphError {
-	const correction = correctionError instanceof Error ? correctionError : new Error(String(correctionError));
-	return new AgentTaskGraphError(`task ${taskId} completion correction failed: ${correction.message}`, {
-		cause: new AggregateError(
-			[initialError, correction],
-			`automatic completion and its bounded correction both failed for task ${taskId}`,
-		),
-	});
 }
 
 function noopRlmChildAbort(): void {}
@@ -1350,7 +1324,7 @@ export class AgentSession {
 	private readonly _taskId?: string;
 	private readonly _taskAccountingTaskId?: string;
 	private readonly _taskActorId?: string;
-	private _taskCompletionCorrection?: AgentTaskCompletionCorrectionConstraint;
+	private _taskCompletionCorrection?: AgentTaskCompletionCorrection;
 	private readonly _turnCapacityPool?: RlmSubagentCapacityPool;
 	private readonly _taskAccountedAssistantMessages = new WeakSet<AssistantMessage>();
 	private _taskAccountingError?: Error;
@@ -9438,35 +9412,25 @@ export class AgentSession {
 					}),
 				};
 			case "rlm.task.complete": {
-				let task: AgentTask;
-				try {
+				const task = this.runTaskCompletionCorrectionAction(taskId, () => {
 					const rawResult = requiredRecord(payload.result, "result") as unknown as AgentTaskResult;
 					const result = this.applyTaskCompletionCorrectionResult(taskId, rawResult);
-					task = graph.completeTask(taskId, callerAgentId, result);
-				} catch (error) {
-					this.recordTaskCompletionCorrectionFailure(taskId, error);
-					throw error;
-				}
-				this.completeTaskCompletionCorrectionAction(taskId);
+					return graph.completeTask(taskId, callerAgentId, result);
+				});
 				await this._drainTaskFamilyPendingResumes();
 				return { task };
 			}
 			case "rlm.task.report_gap": {
-				let gap: AgentTaskGap;
-				try {
-					gap = graph.reportGap(taskId, callerAgentId, {
+				const gap = this.runTaskCompletionCorrectionAction(taskId, () =>
+					graph.reportGap(taskId, callerAgentId, {
 						kind: requiredGapKind(payload.kind),
 						description: requiredString(payload.description, "description"),
 						...(typeof payload.needed_information === "string"
 							? { neededInformation: payload.needed_information }
 							: {}),
 						evidenceRefs: optionalStringArray(payload.evidence_refs, "evidence_refs"),
-					});
-				} catch (error) {
-					this.recordTaskCompletionCorrectionFailure(taskId, error);
-					throw error;
-				}
-				this.completeTaskCompletionCorrectionAction(taskId);
+					}),
+				);
 				await this._drainTaskFamilyPendingResumes();
 				return { gap };
 			}
@@ -9497,31 +9461,22 @@ export class AgentSession {
 	private applyTaskCompletionCorrectionResult(taskId: string, result: AgentTaskResult): AgentTaskResult {
 		const correction = this._taskCompletionCorrection;
 		if (!correction || correction.taskId !== taskId) return result;
-		if (correction.actionCompleted) {
-			throw new AgentTaskGraphError("task completion correction already completed its bounded action");
-		}
-		const submittedEvidence = Array.isArray(result.evidenceRefs) ? result.evidenceRefs : [];
 		const durableEvidence = this._taskGraph?.getTask(taskId).progress?.evidenceRefs ?? [];
-		return {
-			...result,
-			summary: correction.hostSummary,
-			evidenceRefs: stableStringUnion(
-				stableStringUnion(correction.requiredEvidenceRefs, durableEvidence),
-				submittedEvidence,
-			),
-		};
+		return constrainTaskCompletionCorrectionResult(correction, result, durableEvidence);
 	}
 
-	private recordTaskCompletionCorrectionFailure(taskId: string, error: unknown): void {
+	private runTaskCompletionCorrectionAction<T>(taskId: string, action: () => T): T {
 		const correction = this._taskCompletionCorrection;
-		if (!correction || correction.taskId !== taskId) return;
-		correction.lastAttemptError = error instanceof Error ? error : new Error(String(error));
-	}
-
-	private completeTaskCompletionCorrectionAction(taskId: string): void {
-		const correction = this._taskCompletionCorrection;
-		if (!correction || correction.taskId !== taskId) return;
-		correction.actionCompleted = true;
+		if (!correction || correction.taskId !== taskId) return action();
+		beginTaskCompletionCorrectionAction(correction);
+		try {
+			const result = action();
+			completeTaskCompletionCorrectionAction(correction);
+			return result;
+		} catch (error) {
+			if (recordTaskCompletionCorrectionFailure(correction, error)) this.requestAbort();
+			throw error;
+		}
 	}
 
 	async reload(): Promise<void> {
@@ -10750,15 +10705,14 @@ export class AgentSession {
 								`Required result schema: ${JSON.stringify(envelope.resultSchema ?? {})}`,
 								`Existing evidence references: ${JSON.stringify(envelope.evidenceRefs)}`,
 								`Rejected conclusion to preserve:\n${rejectedConclusion}`,
-								"Do not continue exploring or revise the substance. Submit the required shape with rlm.task.complete, or call rlm.task.report_gap if required evidence is genuinely missing. The host preserves the rejected summary and stable-unions its durable evidence into a successful completion. A rejected task-tool call may be corrected and retried within this one bounded turn; only one successful completion or gap report is accepted. This turn is not auto-completed.",
+								`Do not continue exploring or revise the substance. Submit the required shape with rlm.task.complete, or call rlm.task.report_gap if required evidence is genuinely missing. The host preserves the rejected summary and stable-unions its durable evidence into a successful completion. You have at most ${AGENT_TASK_COMPLETION_CORRECTION_MAX_ATTEMPTS} task-action attempts in this bounded turn; only one successful completion or gap report is accepted. This turn is not auto-completed.`,
 							].join("\n\n");
-							const correction: AgentTaskCompletionCorrectionConstraint = {
+							const correction = createTaskCompletionCorrection({
 								taskId: delegatedTaskId,
 								hostSummary: rejectedConclusion,
 								requiredEvidenceRefs: [...envelope.evidenceRefs],
 								initialError: error,
-								actionCompleted: false,
-							};
+							});
 							child._taskCompletionCorrection = correction;
 							try {
 								await child.promptAndWait(repair, {

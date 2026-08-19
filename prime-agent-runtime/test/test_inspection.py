@@ -18,6 +18,7 @@ class InspectionFilterTest(unittest.TestCase):
 
         self.assertEqual(architecture.seccomp_syscall, 317)
         self.assertEqual(architecture.exec_syscalls, (59, 322))
+        self.assertEqual(architecture.cross_process_syscalls, (101, 310, 311))
         self.assertEqual(
             values[4:6],
             [
@@ -39,6 +40,7 @@ class InspectionFilterTest(unittest.TestCase):
 
         self.assertEqual(architecture.seccomp_syscall, 277)
         self.assertEqual(architecture.exec_syscalls, (221, 281))
+        self.assertEqual(architecture.cross_process_syscalls, (117, 270, 271))
         self.assertNotIn(inspection._BPF_JMP_JGE_K, [value[0] for value in values])
 
     def test_fails_closed_off_linux(self) -> None:
@@ -143,6 +145,20 @@ class InspectionFilterTest(unittest.TestCase):
                     libc.execve(b"/prime-agent-missing", argv, envp),
                     ctypes.get_errno(),
                 ]
+                machine = platform.machine().lower()
+                execveat_number = 322 if machine in ("x86_64", "amd64") else 281
+                ctypes.set_errno(0)
+                result["execveat"] = [
+                    libc.syscall(
+                        execveat_number,
+                        -100,
+                        b"/prime-agent-missing",
+                        argv,
+                        envp,
+                        0,
+                    ),
+                    ctypes.get_errno(),
+                ]
                 done.set()
 
             thread = threading.Thread(target=worker)
@@ -160,12 +176,28 @@ class InspectionFilterTest(unittest.TestCase):
             else:
                 raise AssertionError("Python audit hook allowed os.system")
 
-            if platform.machine().lower() in ("x86_64", "amd64"):
-                libc = ctypes.CDLL(None, use_errno=True)
-                libc.syscall.argtypes = [ctypes.c_long]
-                libc.syscall.restype = ctypes.c_long
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.syscall.restype = ctypes.c_long
+            machine = platform.machine().lower()
+            cross_process_syscalls = (
+                (101, 310, 311)
+                if machine in ("x86_64", "amd64")
+                else (117, 270, 271)
+            )
+            for name, number in zip(
+                ("ptrace", "process_vm_readv", "process_vm_writev"),
+                cross_process_syscalls,
+            ):
                 ctypes.set_errno(0)
-                result["x32"] = [libc.syscall(0x40000027), ctypes.get_errno()]
+                result[name] = [libc.syscall(number, -1, 0, 0, 0, 0, 0), ctypes.get_errno()]
+
+            if machine in ("x86_64", "amd64"):
+                for name, number in (
+                    ("x32_execve", 0x40000208),
+                    ("x32_execveat", 0x40000221),
+                ):
+                    ctypes.set_errno(0)
+                    result[name] = [libc.syscall(number, 0, 0, 0, 0, 0), ctypes.get_errno()]
 
             print(json.dumps(result))
             """
@@ -182,9 +214,14 @@ class InspectionFilterTest(unittest.TestCase):
         )
         result = json.loads(completed.stdout)
         self.assertEqual(result["execve"], [-1, errno.EPERM])
+        self.assertEqual(result["execveat"], [-1, errno.EPERM])
         self.assertEqual(result["audit"], "blocked")
+        self.assertEqual(result["ptrace"], [-1, errno.EPERM])
+        self.assertEqual(result["process_vm_readv"], [-1, errno.EPERM])
+        self.assertEqual(result["process_vm_writev"], [-1, errno.EPERM])
         if platform.machine().lower() in ("x86_64", "amd64"):
-            self.assertEqual(result["x32"], [-1, errno.EPERM])
+            self.assertEqual(result["x32_execve"], [-1, errno.EPERM])
+            self.assertEqual(result["x32_execveat"], [-1, errno.EPERM])
 
 
 if __name__ == "__main__":

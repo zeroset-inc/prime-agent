@@ -75,10 +75,9 @@ del _prime_agent_enforce_inspection_only
 
 export function buildRlmBootstrapCode(pythonSkills: readonly PythonSkillRuntimeInfo[] = []): string {
 	const importNames = [...new Set(pythonSkills.map((skill) => skill.importName))];
-	const skillsCode =
-		importNames.length === 0
-			? RLM_BOOTSTRAP_BASE_CODE
-			: `
+	return importNames.length === 0
+		? RLM_BOOTSTRAP_BASE_CODE
+		: `
 ${RLM_BOOTSTRAP_BASE_CODE}
 
 import importlib as _prime_agent_importlib
@@ -143,7 +142,6 @@ for _prime_agent_skill_name in ${JSON.stringify(importNames)}:
             str(_prime_agent_skill_error),
         )
 `.trim();
-	return skillsCode;
 }
 
 const ipythonSchema = Type.Object({
