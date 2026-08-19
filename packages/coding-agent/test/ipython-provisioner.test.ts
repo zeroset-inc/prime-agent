@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -344,23 +345,86 @@ describe("IpythonKernelProvisioner", () => {
 		expect(existsSync(manifest)).toBe(true);
 	});
 
-	it("enforces inspection-only subprocess policy in the Python runtime", () => {
+	it.skipIf(process.platform !== "linux")(
+		"enforces inspection-only process execution at the Linux syscall boundary",
+		() => {
+			const bootstrap = buildRlmBootstrapCode([], "inspection_only");
+			const script = [
+				"class _PrimeTestIpython:",
+				"    colors = None",
+				"def get_ipython():",
+				"    return _PrimeTestIpython()",
+				bootstrap,
+				"import _posixsubprocess, ctypes, errno, multiprocessing, os, subprocess",
+				"blocked = []",
+				"for operation in [lambda: os.system('true'), lambda: subprocess.run(['/bin/true'])]:",
+				"    try:",
+				"        operation()",
+				"    except PermissionError:",
+				"        blocked.append(True)",
+				"libc = ctypes.CDLL(None, use_errno=True)",
+				"argv = (ctypes.c_char_p * 2)(b'/bin/true', None)",
+				"envp = (ctypes.c_char_p * 1)(None)",
+				"ctypes.set_errno(0)",
+				"assert libc.execve(b'/bin/true', argv, envp) == -1",
+				"assert ctypes.get_errno() == errno.EPERM",
+				"assert libc.system(b'/bin/true') != 0",
+				"errpipe_read, errpipe_write = os.pipe()",
+				"fork_exec_args = (",
+				"    [b'/bin/true'], (b'/bin/true',), True, (errpipe_write,), None, None,",
+				"    -1, -1, -1, -1, -1, -1, errpipe_read, errpipe_write,",
+				"    True, False, -1, None, None, None, -1, None,",
+				")",
+				"try:",
+				"    pid = _posixsubprocess.fork_exec(*fork_exec_args, False)",
+				"except TypeError:",
+				"    pid = _posixsubprocess.fork_exec(*fork_exec_args)",
+				"os.close(errpipe_write)",
+				"fork_exec_error = os.read(errpipe_read, 50000)",
+				"os.close(errpipe_read)",
+				"os.waitpid(pid, 0)",
+				"assert fork_exec_error",
+				"try:",
+				"    child = multiprocessing.get_context('fork').Process(target=lambda: None)",
+				"    child.start()",
+				"except PermissionError:",
+				"    blocked.append(True)",
+				"else:",
+				"    child.join()",
+				"    raise AssertionError('multiprocessing escaped inspection-only execution')",
+				"assert len(blocked) == 3",
+			].join("\n");
+			const result = spawnSync("python3", ["-c", script], { cwd: tempDir, encoding: "utf8" });
+			expect(result.status, result.stderr).toBe(0);
+		},
+	);
+
+	it("fails closed when inspection-only syscall enforcement is unavailable", () => {
 		const bootstrap = buildRlmBootstrapCode([], "inspection_only");
+		const script = [
+			"import sys",
+			"sys.platform = 'unsupported-prime-test'",
+			"class _PrimeTestIpython:",
+			"    colors = None",
+			"def get_ipython():",
+			"    return _PrimeTestIpython()",
+			bootstrap,
+		].join("\n");
+		const result = spawnSync("python3", ["-c", script], { cwd: tempDir, encoding: "utf8" });
+		expect(result.status).not.toBe(0);
+		expect(result.stderr).toContain("inspection-only execution requires Linux seccomp enforcement");
+	});
+
+	it("leaves general Python runtimes unrestricted", () => {
+		const bootstrap = buildRlmBootstrapCode([]);
 		const script = [
 			"class _PrimeTestIpython:",
 			"    colors = None",
 			"def get_ipython():",
 			"    return _PrimeTestIpython()",
 			bootstrap,
-			"import os, subprocess",
-			"blocked = []",
-			"for operation in [lambda: os.system('true'), lambda: subprocess.run(['/bin/sh', '-c', 'true']), lambda: subprocess.run(['/usr/bin/git', 'diff', '--ext-diff'])]:",
-			"    try:",
-			"        operation()",
-			"    except PermissionError:",
-			"        blocked.append(True)",
-			"subprocess.run(['/usr/bin/git', 'status'], cwd='.', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
-			"assert len(blocked) == 3",
+			"import subprocess",
+			"subprocess.run(['true'], check=True)",
 		].join("\n");
 		const result = spawnSync("python3", ["-c", script], { cwd: tempDir, encoding: "utf8" });
 		expect(result.status, result.stderr).toBe(0);
@@ -397,5 +461,3 @@ describe("KernelManager session cleanup during startup", () => {
 		}
 	});
 });
-
-import { spawnSync } from "node:child_process";

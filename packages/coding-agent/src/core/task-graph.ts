@@ -10,6 +10,12 @@ export const AGENT_TASK_RESULT_MAX_BYTES = 64 * 1024;
 export const AGENT_TASK_SNAPSHOT_PAGE_MAX_ITEMS = 100;
 export const AGENT_TASK_SNAPSHOT_COMPACT_EVENT_THRESHOLD = 128;
 export const AGENT_TASK_SNAPSHOT_COMPACT_BYTE_THRESHOLD = 512 * 1024;
+export const AGENT_TASK_GRAPH_POLICY_CAPABILITIES = Object.freeze({
+	version: 2,
+	graphScopedExecutionProfile: true,
+	constrainedCompletionCorrection: true,
+	boundedDelegatedTaskConvergence: true,
+} as const);
 
 export type AgentTaskStatus =
 	| "pending"
@@ -251,6 +257,7 @@ export interface AgentTaskGraphPolicy {
 	delegatedTaskConvergence?: {
 		maxToolCallsWithoutEvidence: number;
 		maxToolCallsAfterSteer: number;
+		maxExplorationToolCalls: number;
 	};
 	/** Opts delegated tasks into one correction turn after an automatic
 	 * completion fails host validation. The correction must explicitly submit
@@ -867,14 +874,19 @@ export class AgentTaskGraph {
 	completeTaskFromRuntime(taskId: string, callerAgentId: string, summary: string): AgentTask {
 		const task = this.findTask(taskId);
 		if (task.status === "completed") return clone(task);
-		return this.completeTask(taskId, callerAgentId, {
+		return this.completeTask(taskId, callerAgentId, this.runtimeCompletionDraft(taskId, summary));
+	}
+
+	runtimeCompletionDraft(taskId: string, summary: string): AgentTaskResult {
+		const task = this.findTask(taskId);
+		return {
 			summary: boundedRuntimeText(summary, "Task completed without a textual result."),
 			verification: [],
 			candidateFindings: [],
 			unresolvedQuestions: [],
 			coverageGaps: [],
 			evidenceRefs: task.progress?.evidenceRefs ?? [],
-		});
+		};
 	}
 
 	canAutoCompleteTask(taskId: string): boolean {
@@ -887,9 +899,13 @@ export class AgentTaskGraph {
 		);
 	}
 
-	delegatedTaskConvergence(
-		taskId: string,
-	): { maxToolCallsWithoutEvidence: number; maxToolCallsAfterSteer: number } | undefined {
+	delegatedTaskConvergence(taskId: string):
+		| {
+				maxToolCallsWithoutEvidence: number;
+				maxToolCallsAfterSteer: number;
+				maxExplorationToolCalls: number;
+		  }
+		| undefined {
 		this.findTask(taskId);
 		const policy = this.policy.delegatedTaskConvergence;
 		if (!policy) return undefined;
@@ -901,8 +917,7 @@ export class AgentTaskGraph {
 		return this.policy.delegatedTaskCompletionCorrection === true;
 	}
 
-	executionProfile(taskId: string): "inspection_only" | undefined {
-		this.findTask(taskId);
+	executionProfile(): "inspection_only" | undefined {
 		return this.policy.executionProfile;
 	}
 
@@ -1597,9 +1612,35 @@ function normalizeText(value: string, field: string, maxLength = AGENT_TASK_TEXT
 
 function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined): AgentTaskGraphPolicy {
 	if (!policy) return {};
+	assertExactObjectKeys(policy, "task graph policy", [
+		"requireExclusiveClaims",
+		"validateDelegation",
+		"validateCompletion",
+		"delegatedTaskConvergence",
+		"delegatedTaskCompletionCorrection",
+		"executionProfile",
+	]);
+	if (policy.requireExclusiveClaims !== undefined && typeof policy.requireExclusiveClaims !== "boolean") {
+		throw new AgentTaskGraphError("requireExclusiveClaims must be a boolean");
+	}
+	for (const field of ["validateDelegation", "validateCompletion"] as const) {
+		if (policy[field] !== undefined && typeof policy[field] !== "function") {
+			throw new AgentTaskGraphError(`${field} must be a function`);
+		}
+	}
 	const convergence = policy.delegatedTaskConvergence;
 	if (convergence) {
-		for (const [field, value] of Object.entries(convergence)) {
+		assertExactObjectKeys(convergence, "delegatedTaskConvergence", [
+			"maxToolCallsWithoutEvidence",
+			"maxToolCallsAfterSteer",
+			"maxExplorationToolCalls",
+		]);
+		for (const field of [
+			"maxToolCallsWithoutEvidence",
+			"maxToolCallsAfterSteer",
+			"maxExplorationToolCalls",
+		] as const) {
+			const value = convergence[field];
 			if (!Number.isSafeInteger(value) || value < 1) {
 				throw new AgentTaskGraphError(`delegatedTaskConvergence.${field} must be a positive integer`);
 			}
@@ -1618,6 +1659,14 @@ function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined)
 		...policy,
 		...(convergence ? { delegatedTaskConvergence: { ...convergence } } : {}),
 	};
+}
+
+function assertExactObjectKeys(value: object, field: string, expectedKeys: readonly string[]): void {
+	const expected = new Set(expectedKeys);
+	const unknown = Object.keys(value).filter((key) => !expected.has(key));
+	if (unknown.length > 0) {
+		throw new AgentTaskGraphError(`${field} contains unsupported fields: ${unknown.join(", ")}`);
+	}
 }
 
 function normalizeIdentifier(value: string, field: string): string {

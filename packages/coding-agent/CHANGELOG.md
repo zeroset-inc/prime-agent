@@ -2,8 +2,10 @@
 
 ## [Unreleased]
 
-- Added opt-in delegated-task convergence with a permanent finalization boundary and an explicit structured-completion correction turn.
-- Added a graph-scoped inspection-only IPython execution profile that enforces read-only subprocess policy without parsing model-authored source text.
+- Added graph-scoped delegated-task convergence with an absolute exploration ceiling and a single structured-completion correction that preserves the rejected conclusion and durable evidence.
+- Added a graph-scoped inspection-only IPython execution profile that fails closed unless Linux seccomp can prevent external process execution across the recursive runtime tree.
+- Fixed task progress updates dropping previously recorded durable evidence or completed questions when later updates omitted those optional fields.
+- Fixed task resume and orchestration-control model turns being attributed as direct user work instead of task-owned usage.
 
 ## [0.7.11] - 2026-08-18
 

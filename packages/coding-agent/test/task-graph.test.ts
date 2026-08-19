@@ -2,7 +2,12 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentTaskGraph, AgentTaskGraphError, formatAgentTaskContextEnvelope } from "../src/core/task-graph.js";
+import {
+	AGENT_TASK_GRAPH_POLICY_CAPABILITIES,
+	AgentTaskGraph,
+	AgentTaskGraphError,
+	formatAgentTaskContextEnvelope,
+} from "../src/core/task-graph.js";
 
 function claim(key: string) {
 	return { namespace: "repo:file", key };
@@ -918,20 +923,70 @@ describe("AgentTaskGraph", () => {
 				directory: invalidDirectory,
 				root: { ownerAgentId: "root-agent", objective: "Review" },
 				policy: {
-					delegatedTaskConvergence: { maxToolCallsWithoutEvidence: 2, maxToolCallsAfterSteer: 0 },
+					delegatedTaskConvergence: {
+						maxToolCallsWithoutEvidence: 2,
+						maxToolCallsAfterSteer: 0,
+						maxExplorationToolCalls: 4,
+					},
 				},
 			}),
 		).toThrow("delegatedTaskConvergence.maxToolCallsAfterSteer must be a positive integer");
 		expect(existsSync(invalidDirectory)).toBe(false);
 	});
 
-	it("preserves cumulative evidence when a progress update omits evidence refs", () => {
+	it("rejects misspelled and incomplete policy fields before creating durable state", () => {
+		const invalidDirectory = join(tmpdir(), `prime-invalid-task-policy-shape-${Date.now()}`);
+		directory = invalidDirectory;
+		expect(() =>
+			AgentTaskGraph.open({
+				directory: invalidDirectory,
+				root: { ownerAgentId: "root-agent", objective: "Review" },
+				policy: {
+					validateCompletionn: () => undefined,
+				} as never,
+			}),
+		).toThrow("task graph policy contains unsupported fields: validateCompletionn");
+		expect(() =>
+			AgentTaskGraph.open({
+				directory: invalidDirectory,
+				root: { ownerAgentId: "root-agent", objective: "Review" },
+				policy: {
+					delegatedTaskConvergence: {
+						maxToolCallsWithoutEvidence: 2,
+						maxToolCallsAfterSteer: 2,
+					} as never,
+				},
+			}),
+		).toThrow("delegatedTaskConvergence.maxExplorationToolCalls must be a positive integer");
+		expect(existsSync(invalidDirectory)).toBe(false);
+	});
+
+	it("publishes an immutable capability contract for policy consumers", () => {
+		expect(Object.isFrozen(AGENT_TASK_GRAPH_POLICY_CAPABILITIES)).toBe(true);
+		expect(AGENT_TASK_GRAPH_POLICY_CAPABILITIES).toEqual({
+			version: 2,
+			graphScopedExecutionProfile: true,
+			constrainedCompletionCorrection: true,
+			boundedDelegatedTaskConvergence: true,
+		});
+	});
+
+	it("preserves omitted progress fields while allowing explicit clearing", () => {
 		const graph = open();
 		graph.updateProgress(graph.rootTaskId, "root-agent", {
 			summary: "First pass",
 			evidenceRefs: ["artifact://first"],
+			completedQuestions: ["runtime behavior"],
 		});
 		graph.updateProgress(graph.rootTaskId, "root-agent", { summary: "Second pass" });
 		expect(graph.getTask(graph.rootTaskId).progress?.evidenceRefs).toEqual(["artifact://first"]);
+		expect(graph.getTask(graph.rootTaskId).progress?.completedQuestions).toEqual(["runtime behavior"]);
+		graph.updateProgress(graph.rootTaskId, "root-agent", {
+			summary: "Clear retained fields",
+			evidenceRefs: [],
+			completedQuestions: [],
+		});
+		expect(graph.getTask(graph.rootTaskId).progress?.evidenceRefs).toEqual([]);
+		expect(graph.getTask(graph.rootTaskId).progress?.completedQuestions).toEqual([]);
 	});
 });

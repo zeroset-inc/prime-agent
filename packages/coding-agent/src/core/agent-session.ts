@@ -1008,6 +1008,13 @@ interface AgentTaskControlMessageDetails {
 	kind: "convergence" | "completion_correction";
 }
 
+interface AgentTaskCompletionCorrectionConstraint {
+	taskId: string;
+	rejectedSummary: string;
+	requiredEvidenceRefs: ReadonlySet<string>;
+	actionAttempted: boolean;
+}
+
 function createAgentTaskControlMessage(
 	taskId: string,
 	kind: AgentTaskControlMessageDetails["kind"],
@@ -1305,6 +1312,7 @@ export class AgentSession {
 	private readonly _taskId?: string;
 	private readonly _taskAccountingTaskId?: string;
 	private readonly _taskActorId?: string;
+	private _taskCompletionCorrection?: AgentTaskCompletionCorrectionConstraint;
 	private readonly _turnCapacityPool?: RlmSubagentCapacityPool;
 	private readonly _taskAccountedAssistantMessages = new WeakSet<AssistantMessage>();
 	private _taskAccountingError?: Error;
@@ -9130,8 +9138,7 @@ export class AgentSession {
 			const notifyRestore = !this._ipythonRuntimeBuilt;
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
-				executionProfile:
-					this._taskGraph && this._taskId ? this._taskGraph.executionProfile(this._taskId) : undefined,
+				executionProfile: this._taskGraph?.executionProfile(),
 				sessionId: this.sessionId,
 				hostHandlers: this._createKernelHostHandlers(),
 				pythonSkills,
@@ -9393,15 +9400,14 @@ export class AgentSession {
 					}),
 				};
 			case "rlm.task.complete": {
-				const task = graph.completeTask(
-					taskId,
-					callerAgentId,
-					requiredRecord(payload.result, "result") as unknown as AgentTaskResult,
-				);
+				const result = requiredRecord(payload.result, "result") as unknown as AgentTaskResult;
+				this.assertTaskCompletionCorrectionResult(taskId, result);
+				const task = graph.completeTask(taskId, callerAgentId, result);
 				await this._drainTaskFamilyPendingResumes();
 				return { task };
 			}
 			case "rlm.task.report_gap": {
+				this.claimTaskCompletionCorrectionAction(taskId, "report a gap");
 				const gap = graph.reportGap(taskId, callerAgentId, {
 					kind: requiredGapKind(payload.kind),
 					description: requiredString(payload.description, "description"),
@@ -9434,6 +9440,32 @@ export class AgentSession {
 				};
 			default:
 				throw new Error(`unsupported task host request: ${type}`);
+		}
+	}
+
+	private claimTaskCompletionCorrectionAction(taskId: string, action: string): void {
+		const correction = this._taskCompletionCorrection;
+		if (!correction || correction.taskId !== taskId) return;
+		if (correction.actionAttempted) {
+			throw new AgentTaskGraphError(`task completion correction already attempted its single ${action}`);
+		}
+		correction.actionAttempted = true;
+	}
+
+	private assertTaskCompletionCorrectionResult(taskId: string, result: AgentTaskResult): void {
+		const correction = this._taskCompletionCorrection;
+		if (!correction || correction.taskId !== taskId) return;
+		this.claimTaskCompletionCorrectionAction(taskId, "structured submission");
+		if (result.summary !== correction.rejectedSummary) {
+			throw new AgentTaskGraphError("task completion correction must preserve the rejected summary exactly");
+		}
+		if (!Array.isArray(result.evidenceRefs) || !result.evidenceRefs.every((value) => typeof value === "string")) {
+			throw new AgentTaskGraphError("task completion correction evidenceRefs must be a string array");
+		}
+		const submittedEvidence = new Set(result.evidenceRefs);
+		const missingEvidence = [...correction.requiredEvidenceRefs].find((value) => !submittedEvidence.has(value));
+		if (missingEvidence) {
+			throw new AgentTaskGraphError(`task completion correction omitted durable evidence: ${missingEvidence}`);
 		}
 	}
 
@@ -10302,6 +10334,11 @@ export class AgentSession {
 		delegation?: AgentTaskDelegationInput,
 		replacementTaskId?: string,
 	): Promise<RlmSpawnHandle> {
+		if (this._taskCompletionCorrection) {
+			throw new AgentTaskGraphError(
+				"task completion correction permits only one explicit task completion or gap report",
+			);
+		}
 		this._pendingRlmSpawnAdmissions += 1;
 		this._notifyQuiescenceChange();
 		try {
@@ -10386,7 +10423,9 @@ export class AgentSession {
 		let activity: RlmChildAgentActivity | undefined;
 		let convergencePhase: "exploring" | "finalizing" = "exploring";
 		let explorationToolCallsWithoutEvidence = 0;
+		let explorationToolCalls = 0;
 		let finalizingToolCalls = 0;
+		let toolCallsSinceConvergenceBoundary = 0;
 		const seenConvergenceEvidenceRefs = new Set<string>();
 		let childSession: AgentSession | undefined;
 		const startupAbortController = new AbortController();
@@ -10557,10 +10596,13 @@ export class AgentSession {
 					} else if (event.type === "tool_execution_end") {
 						runningToolCount = Math.max(0, runningToolCount - 1);
 						if (runningToolCount === 0) activity = { kind: "waiting" };
+						toolCallsSinceConvergenceBoundary += 1;
+						emitChildUpdate();
+					} else if (event.type === "turn_end") {
 						if (delegatedTaskId && this._taskGraph) {
 							const policy = this._taskGraph.delegatedTaskConvergence(delegatedTaskId);
-							if (policy) {
-								const task = this._taskGraph.getTask(delegatedTaskId);
+							const task = this._taskGraph.getTask(delegatedTaskId);
+							if (policy && task.status === "running" && task.ownerAgentId === childNodeId) {
 								let discoveredEvidence = false;
 								for (const evidenceRef of task.progress?.evidenceRefs ?? []) {
 									if (seenConvergenceEvidenceRefs.has(evidenceRef)) continue;
@@ -10569,30 +10611,33 @@ export class AgentSession {
 								}
 								if (convergencePhase === "exploring") {
 									if (discoveredEvidence) explorationToolCallsWithoutEvidence = 0;
-									explorationToolCallsWithoutEvidence += 1;
-									if (explorationToolCallsWithoutEvidence >= policy.maxToolCallsWithoutEvidence) {
+									explorationToolCallsWithoutEvidence += toolCallsSinceConvergenceBoundary;
+									explorationToolCalls += toolCallsSinceConvergenceBoundary;
+									if (
+										explorationToolCallsWithoutEvidence >= policy.maxToolCallsWithoutEvidence ||
+										explorationToolCalls >= policy.maxExplorationToolCalls
+									) {
 										convergencePhase = "finalizing";
-										child.requestAbort();
 										const directive =
-											"You have reached this task's evidence-convergence boundary without recording new durable evidence. Stop broad exploration now. Record supported evidence with rlm.task.update, then submit the bounded structured conclusion. Report a precise gap if the task cannot be completed.";
-										void child
-											._queuePreparedPrompt("steer", directive, undefined, {
-												queueKey: `task-convergence:${delegatedTaskId}`,
-												resumeIfIdle: true,
-												message: createAgentTaskControlMessage(delegatedTaskId, "convergence", directive),
-											})
-											.catch(() => undefined);
+											"You have reached this task's evidence-convergence boundary. Stop broad exploration now. Record supported evidence with rlm.task.update, then submit the bounded structured conclusion. Report a precise gap if the task cannot be completed.";
+										child.agent.steer(
+											createAgentTaskControlMessage(delegatedTaskId, "convergence", directive),
+										);
 									}
 								} else {
-									finalizingToolCalls += 1;
+									finalizingToolCalls += toolCallsSinceConvergenceBoundary;
 									if (finalizingToolCalls >= policy.maxToolCallsAfterSteer && !run.error) {
-										run.error = `Delegated task ${delegatedTaskId} did not converge after its finalization boundary`;
-										this._taskGraph.interruptTask(delegatedTaskId, childNodeId, run.error);
-										child.requestAbort();
+										const current = this._taskGraph.getTask(delegatedTaskId);
+										if (current.status === "running" && current.ownerAgentId === childNodeId) {
+											run.error = `Delegated task ${delegatedTaskId} did not converge after its finalization boundary`;
+											this._taskGraph.interruptTask(delegatedTaskId, childNodeId, run.error);
+											child.requestAbort();
+										}
 									}
 								}
 							}
 						}
+						toolCallsSinceConvergenceBoundary = 0;
 						emitChildUpdate();
 					} else if (event.type === "session_info_changed" || event.type === "recap_update") {
 						emitChildUpdate();
@@ -10634,18 +10679,18 @@ export class AgentSession {
 				if (delegatedTaskId && this._taskGraph) {
 					const stillOwned = this._taskGraph.getTask(delegatedTaskId).ownerAgentId === childNodeId;
 					if (stillOwned && this._taskGraph.canAutoCompleteTask(delegatedTaskId)) {
+						const runtimeDraft = this._taskGraph.runtimeCompletionDraft(
+							delegatedTaskId,
+							child.getLastAssistantText() ?? "Task completed without a textual result.",
+						);
 						try {
-							this._taskGraph.completeTaskFromRuntime(
-								delegatedTaskId,
-								childNodeId,
-								child.getLastAssistantText() ?? "Task completed without a textual result.",
-							);
+							this._taskGraph.completeTask(delegatedTaskId, childNodeId, runtimeDraft);
 						} catch (error) {
 							if (!(error instanceof AgentTaskGraphError)) throw error;
 							if (!this._taskGraph.allowsDelegatedTaskCompletionCorrection(delegatedTaskId)) throw error;
 							const envelope = this._taskGraph.contextEnvelope(delegatedTaskId);
-							const rejectedConclusion =
-								child.getLastAssistantText() ?? "Task completed without a textual result.";
+							const rejectedConclusion = runtimeDraft.summary;
+							const initialGapIds = new Set(this._taskGraph.getTask(delegatedTaskId).gaps.map((gap) => gap.id));
 							const repair = [
 								"[task completion correction]",
 								"Your investigation produced a conclusion, but its structured task completion was rejected.",
@@ -10655,20 +10700,35 @@ export class AgentSession {
 								`Rejected conclusion to preserve:\n${rejectedConclusion}`,
 								"Do not continue exploring or revise the substance. Reproduce the existing conclusion and evidence in the required shape, then call rlm.task.complete exactly once. If required evidence is genuinely missing, call rlm.task.report_gap instead. This turn is not auto-completed; only an explicit task tool call is accepted.",
 							].join("\n\n");
-							await child.promptAndWait(repair, {
-								expandPromptTemplates: false,
-								source: "extension",
-								customMessage: createAgentTaskControlMessage(delegatedTaskId, "completion_correction", repair),
-							});
-							throwIfCancelled();
-							await child.waitForQuiescence({ signal: startupAbortController.signal });
-							throwIfCancelled();
-							if (run.error) throw new Error(run.error);
+							child._taskCompletionCorrection = {
+								taskId: delegatedTaskId,
+								rejectedSummary: rejectedConclusion,
+								requiredEvidenceRefs: new Set(envelope.evidenceRefs),
+								actionAttempted: false,
+							};
+							try {
+								await child.promptAndWait(repair, {
+									expandPromptTemplates: false,
+									source: "extension",
+									customMessage: createAgentTaskControlMessage(
+										delegatedTaskId,
+										"completion_correction",
+										repair,
+									),
+								});
+								throwIfCancelled();
+								await child.waitForQuiescence({ signal: startupAbortController.signal });
+								throwIfCancelled();
+								if (run.error) throw new Error(run.error);
+							} finally {
+								child._taskCompletionCorrection = undefined;
+							}
 							const correctedTask = this._taskGraph.getTask(delegatedTaskId);
-							if (
-								correctedTask.ownerAgentId === childNodeId &&
-								this._taskGraph.canAutoCompleteTask(delegatedTaskId)
-							) {
+							const reportedGap = correctedTask.gaps.some(
+								(gap) =>
+									!initialGapIds.has(gap.id) && gap.status === "open" && gap.reportedByAgentId === childNodeId,
+							);
+							if (correctedTask.status !== "completed" && !(correctedTask.status === "blocked" && reportedGap)) {
 								throw new AgentTaskGraphError(
 									`task ${delegatedTaskId} completion correction did not explicitly complete the task or report a gap`,
 								);

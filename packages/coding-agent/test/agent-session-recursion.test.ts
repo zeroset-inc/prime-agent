@@ -137,6 +137,7 @@ interface InspectableRlmSession {
 	_rlmChildCleanupFailures: Map<string, Awaited<ReturnType<AgentSession["listRlmSubagents"]>>["subagents"][number]>;
 	_rlmChildSessions: Map<string, AgentSession>;
 	_rlmChildUnsubscribes: Map<string, () => void>;
+	_ipythonKernelProvisioner?: { options?: { executionProfile?: "inspection_only" } };
 	_createKernelHostHandlers(): HostRequestHandlers;
 	_drainPendingTaskResumes(): Promise<void>;
 	_getContinuationMessages(context: GetContinuationMessagesContext, signal?: AbortSignal): Promise<AgentMessage[]>;
@@ -773,6 +774,57 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
+	it("propagates a graph-scoped execution profile through root, delegated, and nested RLM sessions", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "profile-propagation-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "profile-propagation-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: { requireExclusiveClaims: true, executionProfile: "inspection_only" },
+		});
+		const root = createSession({
+			sessionManager,
+			maxDepth: 3,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+		});
+		expect((root as unknown as InspectableRlmSession)._ipythonKernelProvisioner?.options?.executionProfile).toBe(
+			"inspection_only",
+		);
+
+		const delegated = await root.delegateRlmChild("Review runtime", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			delegationReason: "Independent runtime boundary",
+		});
+		await waitFor(() => graph.getTask(delegated.task_id!).status === "completed");
+		const delegatedSession = root.getRlmChildSession(delegated.rlm_child_id);
+		expect(
+			(delegatedSession as unknown as InspectableRlmSession)._ipythonKernelProvisioner?.options?.executionProfile,
+		).toBe("inspection_only");
+
+		const nested = await delegatedSession!.runRlmChild("Inspect a narrower helper");
+		await waitFor(
+			() => delegatedSession!.getRlmChildSession(nested.rlm_child_id)?.getLastAssistantText() !== undefined,
+		);
+		const nestedSession = delegatedSession!.getRlmChildSession(nested.rlm_child_id);
+		expect(
+			(nestedSession as unknown as InspectableRlmSession)._ipythonKernelProvisioner?.options?.executionProfile,
+		).toBe("inspection_only");
+
+		const general = createSession({ maxDepth: 1 });
+		expect(
+			(general as unknown as InspectableRlmSession)._ipythonKernelProvisioner?.options?.executionProfile,
+		).toBeUndefined();
+	});
+
 	it("requires an explicit structured submission during a delegated completion correction", async () => {
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "completion-repair-sessions"));
 		const graph = AgentTaskGraph.open({
@@ -789,8 +841,8 @@ describe("AgentSession rlm recursion", () => {
 				requireExclusiveClaims: true,
 				delegatedTaskCompletionCorrection: true,
 				validateCompletion: ({ task, result }) => {
-					if (task.parentTaskId && !result.summary.includes("structured")) {
-						throw new AgentTaskGraphError("summary must contain structured");
+					if (task.parentTaskId && result.data?.format !== "structured") {
+						throw new AgentTaskGraphError("result data must be structured");
 					}
 				},
 			},
@@ -807,7 +859,23 @@ describe("AgentSession rlm recursion", () => {
 					?.content;
 				const prompt = userText(context) || (typeof rawContent === "string" ? rawContent : "");
 				prompts.push(prompt);
-				if (!prompt.includes("[task completion correction]")) return streamAnswer("useful conclusion");
+				if (!prompt.includes("[task completion correction]")) {
+					const stream = createAssistantMessageEventStream();
+					queueMicrotask(() => {
+						const task = graph
+							.getSnapshot()
+							.tasks.find((candidate) => candidate.parentTaskId === graph.rootTaskId);
+						if (!task) throw new Error("expected a delegated task");
+						if (task.status === "running") {
+							graph.updateProgress(task.id, task.ownerAgentId, {
+								summary: "Inspected runtime evidence",
+								evidenceRefs: ["artifact://runtime-review"],
+							});
+						}
+						stream.push({ type: "done", reason: "stop", message: assistantMessage("useful conclusion") });
+					});
+					return stream;
+				}
 				const stream = createAssistantMessageEventStream();
 				queueMicrotask(async () => {
 					const child = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0]?.session;
@@ -815,12 +883,13 @@ describe("AgentSession rlm recursion", () => {
 					const handlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
 					await handlers["rlm.task.complete"]?.({
 						result: {
-							summary: "useful structured conclusion",
+							summary: "useful conclusion",
 							verification: [],
 							candidateFindings: [],
 							unresolvedQuestions: [],
 							coverageGaps: [],
-							evidenceRefs: [],
+							evidenceRefs: ["artifact://runtime-review"],
+							data: { format: "structured" },
 						},
 					});
 					stream.push({ type: "done", reason: "stop", message: assistantMessage("submission complete") });
@@ -838,12 +907,181 @@ describe("AgentSession rlm recursion", () => {
 		});
 
 		await waitFor(() => graph.getTask(spawned.task_id!).status === "completed");
-		expect(graph.getTask(spawned.task_id!).result?.summary).toBe("useful structured conclusion");
+		expect(graph.getTask(spawned.task_id!).result?.summary).toBe("useful conclusion");
 		const repairPrompts = prompts.filter((prompt) => prompt.includes("[task completion correction]"));
 		expect(repairPrompts).toHaveLength(1);
-		expect(repairPrompts[0]).toContain("Validation error: summary must contain structured");
+		expect(repairPrompts[0]).toContain("Validation error: result data must be structured");
 		expect(repairPrompts[0]).toContain('Required result schema: {"summary":"string"}');
+		expect(repairPrompts[0]).toContain('Existing evidence references: ["artifact://runtime-review"]');
 		expect(repairPrompts[0]).toContain("Rejected conclusion to preserve:\nuseful conclusion");
+	});
+
+	it.each([
+		{
+			name: "rewritten conclusions",
+			summary: "revised conclusion",
+			evidenceRefs: ["artifact://runtime-review"],
+			expectedError: "must preserve the rejected summary exactly",
+		},
+		{
+			name: "dropped evidence",
+			summary: "useful conclusion",
+			evidenceRefs: [],
+			expectedError: "omitted durable evidence: artifact://runtime-review",
+		},
+	])("rejects $name during the single completion-correction attempt", async (correction) => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, `completion-${correction.name}-sessions`));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, `completion-${correction.name}-coordination`),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: {
+				requireExclusiveClaims: true,
+				delegatedTaskCompletionCorrection: true,
+				validateCompletion: ({ task, result }) => {
+					if (task.parentTaskId && result.data?.format !== "structured") {
+						throw new AgentTaskGraphError("result data must be structured");
+					}
+				},
+			},
+		});
+		let completionError = "";
+		let delegationError = "";
+		let root: AgentSession;
+		root = createSession({
+			sessionManager,
+			maxDepth: 2,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+			streamFn: (_model, context) => {
+				const rawContent = (context.messages[context.messages.length - 1] as { content?: unknown } | undefined)
+					?.content;
+				const prompt = userText(context) || (typeof rawContent === "string" ? rawContent : "");
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(async () => {
+					if (!prompt.includes("[task completion correction]")) {
+						const task = graph
+							.getSnapshot()
+							.tasks.find((candidate) => candidate.parentTaskId === graph.rootTaskId);
+						if (!task) throw new Error("expected a delegated task");
+						if (task.status === "running") {
+							graph.updateProgress(task.id, task.ownerAgentId, {
+								summary: "Inspected runtime evidence",
+								evidenceRefs: ["artifact://runtime-review"],
+							});
+						}
+						stream.push({ type: "done", reason: "stop", message: assistantMessage("useful conclusion") });
+						return;
+					}
+					const child = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0]?.session;
+					if (!child) throw new Error("expected an active delegated child session");
+					const handlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
+					try {
+						await child.runRlmChild("Explore another subsystem");
+					} catch (error) {
+						delegationError = error instanceof Error ? error.message : String(error);
+					}
+					try {
+						await handlers["rlm.task.complete"]?.({
+							result: {
+								summary: correction.summary,
+								verification: [],
+								candidateFindings: [],
+								unresolvedQuestions: [],
+								coverageGaps: [],
+								evidenceRefs: correction.evidenceRefs,
+								data: { format: "structured" },
+							},
+						});
+					} catch (error) {
+						completionError = error instanceof Error ? error.message : String(error);
+					}
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("correction rejected") });
+				});
+				return stream;
+			},
+		});
+
+		const spawned = await root.delegateRlmChild("Review runtime", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			resultSchema: { summary: "string" },
+			delegationReason: "Independent runtime boundary",
+		});
+
+		await waitFor(() => graph.getTask(spawned.task_id!).status === "interrupted");
+		expect(completionError).toContain(correction.expectedError);
+		expect(delegationError).toContain("permits only one explicit task completion or gap report");
+	});
+
+	it("accepts a newly reported open gap as the only alternative completion-correction outcome", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "completion-gap-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "completion-gap-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: {
+				requireExclusiveClaims: true,
+				delegatedTaskCompletionCorrection: true,
+				validateCompletion: ({ task }) => {
+					if (task.parentTaskId) throw new AgentTaskGraphError("verification evidence is required");
+				},
+			},
+		});
+		let root: AgentSession;
+		root = createSession({
+			sessionManager,
+			maxDepth: 2,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+			streamFn: (_model, context) => {
+				const rawContent = (context.messages[context.messages.length - 1] as { content?: unknown } | undefined)
+					?.content;
+				const prompt = userText(context) || (typeof rawContent === "string" ? rawContent : "");
+				if (!prompt.includes("[task completion correction]")) return streamAnswer("bounded conclusion");
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(async () => {
+					const child = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0]?.session;
+					if (!child) throw new Error("expected an active delegated child session");
+					const handlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
+					await handlers["rlm.task.report_gap"]?.({
+						kind: "coverage",
+						description: "The required native verifier is unavailable",
+					});
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("gap reported") });
+				});
+				return stream;
+			},
+		});
+
+		const spawned = await root.delegateRlmChild("Review runtime", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			delegationReason: "Independent runtime boundary",
+		});
+
+		await waitFor(() => graph.getTask(spawned.task_id!).status === "blocked");
+		expect(graph.getTask(spawned.task_id!).gaps).toEqual([
+			expect.objectContaining({
+				kind: "coverage",
+				status: "open",
+				description: "The required native verifier is unavailable",
+			}),
+		]);
 	});
 
 	it("steers delegated exploration after the host evidence boundary", async () => {
@@ -870,7 +1108,11 @@ describe("AgentSession rlm recursion", () => {
 			},
 			policy: {
 				requireExclusiveClaims: true,
-				delegatedTaskConvergence: { maxToolCallsWithoutEvidence: 2, maxToolCallsAfterSteer: 2 },
+				delegatedTaskConvergence: {
+					maxToolCallsWithoutEvidence: 2,
+					maxToolCallsAfterSteer: 2,
+					maxExplorationToolCalls: 6,
+				},
 			},
 		});
 		let toolSequence = 0;
@@ -927,6 +1169,192 @@ describe("AgentSession rlm recursion", () => {
 		const child = root.getRlmChildSession(spawned.rlm_child_id);
 		expect(child?.messages.filter((message) => message.role === "toolResult").length).toBeLessThanOrEqual(3);
 	});
+
+	it("steers at the absolute exploration ceiling even while evidence keeps changing", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "absolute-convergence-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "absolute-convergence-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: {
+				requireExclusiveClaims: true,
+				delegatedTaskConvergence: {
+					maxToolCallsWithoutEvidence: 2,
+					maxToolCallsAfterSteer: 2,
+					maxExplorationToolCalls: 3,
+				},
+			},
+		});
+		let delegatedTaskId = "";
+		let toolSequence = 0;
+		let sawConvergencePrompt = false;
+		const tool = {
+			name: "inspect",
+			description: "Inspect repository state",
+			label: "inspect",
+			parameters: Type.Object({ query: Type.String() }),
+			execute: async (_toolCallId: string, params: { query: string }) => {
+				toolSequence += 1;
+				const task = graph.getTask(delegatedTaskId);
+				graph.updateProgress(delegatedTaskId, task.ownerAgentId, {
+					summary: `Evidence ${toolSequence}`,
+					evidenceRefs: [`artifact://runtime-${toolSequence}`],
+				});
+				return { content: [{ type: "text" as const, text: params.query }], details: {} };
+			},
+		};
+		const root = createSession({
+			sessionManager,
+			maxDepth: 2,
+			customTools: [tool],
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+			streamFn: (_model, context) => {
+				const rawContent = (context.messages[context.messages.length - 1] as { content?: unknown } | undefined)
+					?.content;
+				const prompt = userText(context) || (typeof rawContent === "string" ? rawContent : "");
+				if (prompt.includes("evidence-convergence boundary")) {
+					sawConvergencePrompt = true;
+					return streamAnswer("bounded conclusion");
+				}
+				if (toolSequence > 6) return streamAnswer("failed to reach absolute boundary");
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() =>
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: {
+							...assistantMessage(""),
+							content: [
+								{
+									type: "toolCall" as const,
+									id: `inspect-${toolSequence + 1}`,
+									name: "inspect",
+									arguments: { query: "new evidence" },
+								},
+							],
+							stopReason: "toolUse" as const,
+						},
+					}),
+				);
+				return stream;
+			},
+		});
+
+		const spawned = await root.delegateRlmChild("Review runtime", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			delegationReason: "Independent runtime boundary",
+		});
+		delegatedTaskId = spawned.task_id!;
+
+		await waitFor(() => graph.getTask(spawned.task_id!).status === "completed");
+		expect(sawConvergencePrompt).toBe(true);
+		expect(
+			root.getRlmChildSession(spawned.rlm_child_id)?.messages.filter((message) => message.role === "toolResult")
+				.length,
+		).toBe(3);
+		expect(graph.getTask(spawned.task_id!).result?.summary).toBe("bounded conclusion");
+	});
+
+	it.each(["completed", "blocked"] as const)(
+		"does not steer or interrupt a task that becomes %s before the convergence turn boundary",
+		async (terminalStatus) => {
+			const sessionManager = SessionManager.create(tempDir, join(tempDir, `terminal-${terminalStatus}-sessions`));
+			const graph = AgentTaskGraph.open({
+				directory: join(tempDir, `terminal-${terminalStatus}-coordination`),
+				root: {
+					ownerAgentId: sessionManager.getSessionId(),
+					objective: "Review the change",
+					exclusiveClaims: [
+						{ namespace: "repo:file", key: "runtime.ts" },
+						{ namespace: "repo:file", key: "installer.ts" },
+					],
+				},
+				policy: {
+					requireExclusiveClaims: true,
+					delegatedTaskConvergence: {
+						maxToolCallsWithoutEvidence: 1,
+						maxToolCallsAfterSteer: 1,
+						maxExplorationToolCalls: 1,
+					},
+				},
+			});
+			let delegatedTaskId = "";
+			const tool = {
+				name: "finish_review",
+				description: "Finish the bounded review",
+				label: "finish review",
+				parameters: Type.Object({}),
+				execute: async () => {
+					const task = graph.getTask(delegatedTaskId);
+					if (terminalStatus === "completed") {
+						graph.completeTaskFromRuntime(delegatedTaskId, task.ownerAgentId, "review complete");
+					} else {
+						graph.reportGap(delegatedTaskId, task.ownerAgentId, {
+							kind: "coverage",
+							description: "native verifier unavailable",
+						});
+					}
+					return { content: [{ type: "text" as const, text: terminalStatus }], details: {} };
+				},
+			};
+			let streamCalls = 0;
+			const root = createSession({
+				sessionManager,
+				maxDepth: 2,
+				customTools: [tool],
+				taskGraph: graph,
+				taskId: graph.rootTaskId,
+				streamFn: () => {
+					streamCalls += 1;
+					if (streamCalls > 1) return streamAnswer("terminal state already recorded");
+					const stream = createAssistantMessageEventStream();
+					queueMicrotask(() =>
+						stream.push({
+							type: "done",
+							reason: "toolUse",
+							message: {
+								...assistantMessage(""),
+								content: [
+									{
+										type: "toolCall" as const,
+										id: `finish-${terminalStatus}`,
+										name: "finish_review",
+										arguments: {},
+									},
+								],
+								stopReason: "toolUse" as const,
+							},
+						}),
+					);
+					return stream;
+				},
+			});
+
+			const spawned = await root.delegateRlmChild("Review runtime", {
+				objective: "Review runtime behavior",
+				scope: "runtime.ts",
+				exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+				delegationReason: "Independent runtime boundary",
+			});
+			delegatedTaskId = spawned.task_id!;
+
+			await waitFor(() => graph.getTask(spawned.task_id!).status === terminalStatus);
+			const child = root.getRlmChildSession(spawned.rlm_child_id);
+			expect(
+				child?.messages.some((message) => message.role === "custom" && message.customType === "agent_task_control"),
+			).toBe(false);
+			expect(graph.getTask(spawned.task_id!).status).toBe(terminalStatus);
+		},
+	);
 
 	it("records provider-reported usage from an aborted task call", async () => {
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "aborted-usage-sessions"));
