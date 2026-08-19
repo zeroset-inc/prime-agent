@@ -250,7 +250,16 @@ export interface AgentTaskGraphPolicy {
 	 * durable evidence progress rather than imposing a task token budget. */
 	delegatedTaskConvergence?: {
 		maxToolCallsWithoutEvidence: number;
+		maxToolCallsAfterSteer: number;
 	};
+	/** Opts delegated tasks into one correction turn after an automatic
+	 * completion fails host validation. The correction must explicitly submit
+	 * a structured result or report a gap. */
+	delegatedTaskCompletionCorrection?: boolean;
+	/** Restricts every task runtime in this graph to repository inspection.
+	 * Python remains available, but project/build subprocesses are denied by
+	 * the kernel rather than inferred from source text. */
+	executionProfile?: "inspection_only";
 }
 
 export interface OpenAgentTaskGraphOptions {
@@ -298,8 +307,8 @@ export class AgentTaskGraph {
 	private fatalError?: Error;
 	private readonly changeWaiters = new Set<() => void>();
 
-	private constructor(options: OpenAgentTaskGraphOptions) {
-		this.policy = options.policy ?? {};
+	private constructor(options: OpenAgentTaskGraphOptions, policy: AgentTaskGraphPolicy) {
+		this.policy = policy;
 		mkdirSync(options.directory, { recursive: true, mode: 0o700 });
 		this.snapshotPath = join(options.directory, "task-graph.snapshot.json");
 		this.eventsPath = join(options.directory, "task-graph.events.jsonl");
@@ -308,7 +317,7 @@ export class AgentTaskGraph {
 	}
 
 	static open(options: OpenAgentTaskGraphOptions): AgentTaskGraph {
-		return new AgentTaskGraph(options);
+		return new AgentTaskGraph(options, normalizeAgentTaskGraphPolicy(options.policy));
 	}
 
 	get rootTaskId(): string {
@@ -736,8 +745,14 @@ export class AgentTaskGraph {
 			status: task.status === "pending" || task.status === "starting" ? "running" : task.status,
 			progress: {
 				summary: normalizeText(progress.summary, "progress.summary"),
-				evidenceRefs: normalizeStringList(progress.evidenceRefs ?? [], "progress.evidenceRefs"),
-				completedQuestions: normalizeStringList(progress.completedQuestions ?? [], "progress.completedQuestions"),
+				evidenceRefs:
+					progress.evidenceRefs === undefined
+						? (task.progress?.evidenceRefs ?? [])
+						: normalizeStringList(progress.evidenceRefs, "progress.evidenceRefs"),
+				completedQuestions:
+					progress.completedQuestions === undefined
+						? (task.progress?.completedQuestions ?? [])
+						: normalizeStringList(progress.completedQuestions, "progress.completedQuestions"),
 				updatedAt: now,
 			},
 		});
@@ -872,16 +887,23 @@ export class AgentTaskGraph {
 		);
 	}
 
-	delegatedTaskConvergence(taskId: string): { maxToolCallsWithoutEvidence: number } | undefined {
+	delegatedTaskConvergence(
+		taskId: string,
+	): { maxToolCallsWithoutEvidence: number; maxToolCallsAfterSteer: number } | undefined {
 		this.findTask(taskId);
 		const policy = this.policy.delegatedTaskConvergence;
 		if (!policy) return undefined;
-		if (!Number.isSafeInteger(policy.maxToolCallsWithoutEvidence) || policy.maxToolCallsWithoutEvidence < 1) {
-			throw new AgentTaskGraphError(
-				"delegatedTaskConvergence.maxToolCallsWithoutEvidence must be a positive integer",
-			);
-		}
 		return { ...policy };
+	}
+
+	allowsDelegatedTaskCompletionCorrection(taskId: string): boolean {
+		this.findTask(taskId);
+		return this.policy.delegatedTaskCompletionCorrection === true;
+	}
+
+	executionProfile(taskId: string): "inspection_only" | undefined {
+		this.findTask(taskId);
+		return this.policy.executionProfile;
 	}
 
 	interruptTask(taskId: string, callerAgentId: string, reason: string): AgentTask {
@@ -1571,6 +1593,31 @@ function normalizeText(value: string, field: string, maxLength = AGENT_TASK_TEXT
 	if (!normalized) throw new AgentTaskGraphError(`${field} must not be empty`);
 	if (normalized.length > maxLength) throw new AgentTaskGraphError(`${field} must be at most ${maxLength} characters`);
 	return normalized;
+}
+
+function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined): AgentTaskGraphPolicy {
+	if (!policy) return {};
+	const convergence = policy.delegatedTaskConvergence;
+	if (convergence) {
+		for (const [field, value] of Object.entries(convergence)) {
+			if (!Number.isSafeInteger(value) || value < 1) {
+				throw new AgentTaskGraphError(`delegatedTaskConvergence.${field} must be a positive integer`);
+			}
+		}
+	}
+	if (
+		policy.delegatedTaskCompletionCorrection !== undefined &&
+		typeof policy.delegatedTaskCompletionCorrection !== "boolean"
+	) {
+		throw new AgentTaskGraphError("delegatedTaskCompletionCorrection must be a boolean");
+	}
+	if (policy.executionProfile !== undefined && policy.executionProfile !== "inspection_only") {
+		throw new AgentTaskGraphError("executionProfile must be inspection_only when provided");
+	}
+	return {
+		...policy,
+		...(convergence ? { delegatedTaskConvergence: { ...convergence } } : {}),
+	};
 }
 
 function normalizeIdentifier(value: string, field: string): string {

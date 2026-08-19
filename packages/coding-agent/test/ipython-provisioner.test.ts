@@ -6,7 +6,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { ExtensionContext } from "../src/core/extensions/types.js";
 import type { KernelBootstrapProgressHandler } from "../src/core/kernel/bootstrap.js";
 import { type ExecuteResult, KernelBusyAfterInterruptError, KernelManager } from "../src/core/kernel/index.js";
-import { createIpythonToolDefinition, IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
+import {
+	buildRlmBootstrapCode,
+	createIpythonToolDefinition,
+	IpythonKernelProvisioner,
+} from "../src/core/tools/ipython.js";
 
 let tempDir = "";
 
@@ -339,6 +343,28 @@ describe("IpythonKernelProvisioner", () => {
 		expect(existsSync(dill)).toBe(true);
 		expect(existsSync(manifest)).toBe(true);
 	});
+
+	it("enforces inspection-only subprocess policy in the Python runtime", () => {
+		const bootstrap = buildRlmBootstrapCode([], "inspection_only");
+		const script = [
+			"class _PrimeTestIpython:",
+			"    colors = None",
+			"def get_ipython():",
+			"    return _PrimeTestIpython()",
+			bootstrap,
+			"import os, subprocess",
+			"blocked = []",
+			"for operation in [lambda: os.system('true'), lambda: subprocess.run(['/bin/sh', '-c', 'true']), lambda: subprocess.run(['/usr/bin/git', 'diff', '--ext-diff'])]:",
+			"    try:",
+			"        operation()",
+			"    except PermissionError:",
+			"        blocked.append(True)",
+			"subprocess.run(['/usr/bin/git', 'status'], cwd='.', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+			"assert len(blocked) == 3",
+		].join("\n");
+		const result = spawnSync("python3", ["-c", script], { cwd: tempDir, encoding: "utf8" });
+		expect(result.status, result.stderr).toBe(0);
+	});
 });
 
 describe("KernelManager session cleanup during startup", () => {
@@ -371,3 +397,5 @@ describe("KernelManager session cleanup during startup", () => {
 		}
 	});
 });
+
+import { spawnSync } from "node:child_process";

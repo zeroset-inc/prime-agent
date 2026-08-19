@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-- Added policy-driven evidence convergence steering and a bounded structured-completion repair turn for delegated tasks.
+- Added opt-in delegated-task convergence with a permanent finalization boundary and an explicit structured-completion correction turn.
+- Added a graph-scoped inspection-only IPython execution profile that enforces read-only subprocess policy without parsing model-authored source text.
 
 ## [0.7.11] - 2026-08-18
 

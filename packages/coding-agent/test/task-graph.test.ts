@@ -909,4 +909,29 @@ describe("AgentTaskGraph", () => {
 			expect.arrayContaining([expect.objectContaining({ taskId: graph.rootTaskId, kind: "ready_for_synthesis" })]),
 		);
 	});
+
+	it("validates convergence policy before creating durable state", () => {
+		const invalidDirectory = join(tmpdir(), `prime-invalid-task-policy-${Date.now()}`);
+		directory = invalidDirectory;
+		expect(() =>
+			AgentTaskGraph.open({
+				directory: invalidDirectory,
+				root: { ownerAgentId: "root-agent", objective: "Review" },
+				policy: {
+					delegatedTaskConvergence: { maxToolCallsWithoutEvidence: 2, maxToolCallsAfterSteer: 0 },
+				},
+			}),
+		).toThrow("delegatedTaskConvergence.maxToolCallsAfterSteer must be a positive integer");
+		expect(existsSync(invalidDirectory)).toBe(false);
+	});
+
+	it("preserves cumulative evidence when a progress update omits evidence refs", () => {
+		const graph = open();
+		graph.updateProgress(graph.rootTaskId, "root-agent", {
+			summary: "First pass",
+			evidenceRefs: ["artifact://first"],
+		});
+		graph.updateProgress(graph.rootTaskId, "root-agent", { summary: "Second pass" });
+		expect(graph.getTask(graph.rootTaskId).progress?.evidenceRefs).toEqual(["artifact://first"]);
+	});
 });

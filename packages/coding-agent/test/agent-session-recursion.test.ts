@@ -773,7 +773,7 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
-	it("gives a rejected delegated completion one formatting-only repair turn", async () => {
+	it("requires an explicit structured submission during a delegated completion correction", async () => {
 		const sessionManager = SessionManager.create(tempDir, join(tempDir, "completion-repair-sessions"));
 		const graph = AgentTaskGraph.open({
 			directory: join(tempDir, "completion-repair-coordination"),
@@ -787,6 +787,7 @@ describe("AgentSession rlm recursion", () => {
 			},
 			policy: {
 				requireExclusiveClaims: true,
+				delegatedTaskCompletionCorrection: true,
 				validateCompletion: ({ task, result }) => {
 					if (task.parentTaskId && !result.summary.includes("structured")) {
 						throw new AgentTaskGraphError("summary must contain structured");
@@ -795,17 +796,36 @@ describe("AgentSession rlm recursion", () => {
 			},
 		});
 		const prompts: string[] = [];
-		const root = createSession({
+		let root: AgentSession;
+		root = createSession({
 			sessionManager,
 			maxDepth: 2,
 			taskGraph: graph,
 			taskId: graph.rootTaskId,
 			streamFn: (_model, context) => {
-				const prompt = userText(context);
+				const rawContent = (context.messages[context.messages.length - 1] as { content?: unknown } | undefined)
+					?.content;
+				const prompt = userText(context) || (typeof rawContent === "string" ? rawContent : "");
 				prompts.push(prompt);
-				return streamAnswer(
-					prompt.includes("[task completion repair]") ? "structured conclusion" : "useful conclusion",
-				);
+				if (!prompt.includes("[task completion correction]")) return streamAnswer("useful conclusion");
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(async () => {
+					const child = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0]?.session;
+					if (!child) throw new Error("expected an active delegated child session");
+					const handlers = (child as unknown as InspectableRlmSession)._createKernelHostHandlers();
+					await handlers["rlm.task.complete"]?.({
+						result: {
+							summary: "useful structured conclusion",
+							verification: [],
+							candidateFindings: [],
+							unresolvedQuestions: [],
+							coverageGaps: [],
+							evidenceRefs: [],
+						},
+					});
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("submission complete") });
+				});
+				return stream;
 			},
 		});
 
@@ -818,11 +838,12 @@ describe("AgentSession rlm recursion", () => {
 		});
 
 		await waitFor(() => graph.getTask(spawned.task_id!).status === "completed");
-		expect(graph.getTask(spawned.task_id!).result?.summary).toBe("structured conclusion");
-		const repairPrompts = prompts.filter((prompt) => prompt.includes("[task completion repair]"));
+		expect(graph.getTask(spawned.task_id!).result?.summary).toBe("useful structured conclusion");
+		const repairPrompts = prompts.filter((prompt) => prompt.includes("[task completion correction]"));
 		expect(repairPrompts).toHaveLength(1);
 		expect(repairPrompts[0]).toContain("Validation error: summary must contain structured");
 		expect(repairPrompts[0]).toContain('Required result schema: {"summary":"string"}');
+		expect(repairPrompts[0]).toContain("Rejected conclusion to preserve:\nuseful conclusion");
 	});
 
 	it("steers delegated exploration after the host evidence boundary", async () => {
@@ -849,7 +870,7 @@ describe("AgentSession rlm recursion", () => {
 			},
 			policy: {
 				requireExclusiveClaims: true,
-				delegatedTaskConvergence: { maxToolCallsWithoutEvidence: 2 },
+				delegatedTaskConvergence: { maxToolCallsWithoutEvidence: 2, maxToolCallsAfterSteer: 2 },
 			},
 		});
 		let toolSequence = 0;
@@ -861,7 +882,9 @@ describe("AgentSession rlm recursion", () => {
 			taskGraph: graph,
 			taskId: graph.rootTaskId,
 			streamFn: (_model, context) => {
-				const prompt = userText(context);
+				const rawContent = (context.messages[context.messages.length - 1] as { content?: unknown } | undefined)
+					?.content;
+				const prompt = userText(context) || (typeof rawContent === "string" ? rawContent : "");
 				if (prompt.includes("evidence-convergence boundary")) {
 					sawConvergencePrompt = true;
 					return streamAnswer("bounded conclusion");

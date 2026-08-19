@@ -67,13 +67,76 @@ except Exception as _prime_agent_rlm_error:
     rlm = _PrimeAgentMissingRlm()
 `.trim();
 
-export function buildRlmBootstrapCode(pythonSkills: readonly PythonSkillRuntimeInfo[] = []): string {
-	const importNames = [...new Set(pythonSkills.map((skill) => skill.importName))];
-	if (importNames.length === 0) {
-		return RLM_BOOTSTRAP_BASE_CODE;
-	}
+const INSPECTION_ONLY_BOOTSTRAP_CODE = `
+import os as _prime_agent_inspection_os
+import sys as _prime_agent_inspection_sys
 
-	return `
+_PRIME_AGENT_SAFE_GIT_COMMANDS = {
+    "blame", "cat-file", "diff", "grep", "log", "ls-files", "merge-base",
+    "rev-parse", "show", "status",
+}
+_PRIME_AGENT_UNSAFE_GIT_OPTIONS = {
+    "--ext-diff", "--filters", "--open-files-in-pager", "--textconv", "-O",
+}
+_PRIME_AGENT_TRUSTED_EXEC_DIRS = {"/bin", "/usr/bin", "/usr/local/bin"}
+_prime_agent_inspection_os.environ["GIT_PAGER"] = "cat"
+_prime_agent_inspection_os.environ["GIT_EXTERNAL_DIFF"] = ""
+_prime_agent_inspection_os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+_prime_agent_inspection_os.environ["GIT_CONFIG_GLOBAL"] = "/dev/null"
+
+def _prime_agent_inspection_argv(args):
+    if isinstance(args, (list, tuple)):
+        return [str(value) for value in args]
+    return []
+
+def _prime_agent_inspection_audit(event, args):
+    if event in {"os.system", "os.exec", "os.posix_spawn", "os.spawn"}:
+        raise PermissionError("inspection-only execution profile blocks process creation")
+    if event != "subprocess.Popen":
+        return
+    executable = str(args[0])
+    argv = _prime_agent_inspection_argv(args[1])
+    resolved = _prime_agent_inspection_os.path.realpath(executable)
+    if not _prime_agent_inspection_os.path.isabs(executable):
+        import shutil as _prime_agent_inspection_shutil
+        located = _prime_agent_inspection_shutil.which(executable)
+        resolved = _prime_agent_inspection_os.path.realpath(located) if located else resolved
+    name = _prime_agent_inspection_os.path.basename(resolved)
+    trusted = _prime_agent_inspection_os.path.dirname(resolved) in _PRIME_AGENT_TRUSTED_EXEC_DIRS
+    environment = args[3]
+    unsafe_git_environment = isinstance(environment, dict) and (
+        environment.get("GIT_PAGER", "cat") != "cat"
+        or environment.get("GIT_EXTERNAL_DIFF", "") != ""
+        or environment.get("GIT_CONFIG_NOSYSTEM", "1") != "1"
+        or environment.get("GIT_CONFIG_GLOBAL", "/dev/null") != "/dev/null"
+    )
+    unsafe_git_option = any(
+        value in _PRIME_AGENT_UNSAFE_GIT_OPTIONS or value.startswith("--open-files-in-pager=")
+        for value in argv[2:]
+    )
+    if name == "git" and trusted and len(argv) > 1 and argv[1] in _PRIME_AGENT_SAFE_GIT_COMMANDS and not unsafe_git_option and not unsafe_git_environment:
+        return
+    if name == "rg" and trusted and not any(value == "--pre" or value.startswith("--pre=") for value in argv[1:]):
+        return
+    raise PermissionError(
+        "inspection-only execution profile permits Python inspection plus direct read-only git/rg subprocesses; "
+        "run build, test, install, or shell commands through the embedding host"
+    )
+
+if not globals().get("_PRIME_AGENT_INSPECTION_AUDIT_INSTALLED"):
+    _prime_agent_inspection_sys.addaudithook(_prime_agent_inspection_audit)
+    _PRIME_AGENT_INSPECTION_AUDIT_INSTALLED = True
+`.trim();
+
+export function buildRlmBootstrapCode(
+	pythonSkills: readonly PythonSkillRuntimeInfo[] = [],
+	executionProfile?: "inspection_only",
+): string {
+	const importNames = [...new Set(pythonSkills.map((skill) => skill.importName))];
+	const skillsCode =
+		importNames.length === 0
+			? RLM_BOOTSTRAP_BASE_CODE
+			: `
 ${RLM_BOOTSTRAP_BASE_CODE}
 
 import importlib as _prime_agent_importlib
@@ -138,6 +201,7 @@ for _prime_agent_skill_name in ${JSON.stringify(importNames)}:
             str(_prime_agent_skill_error),
         )
 `.trim();
+	return executionProfile === "inspection_only" ? `${skillsCode}\n\n${INSPECTION_ONLY_BOOTSTRAP_CODE}` : skillsCode;
 }
 
 const ipythonSchema = Type.Object({
@@ -279,6 +343,7 @@ export interface IpythonToolOptions {
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly PythonSkillRuntimeInfo[];
+	executionProfile?: "inspection_only";
 	/** Per-session artifact dir where the kernel namespace snapshot is stored. Omit to disable snapshots. */
 	snapshotDir?: string;
 	/** Resolves before this kernel starts — e.g. the previous provisioner's dispose, so a
@@ -516,9 +581,12 @@ export class IpythonKernelProvisioner {
 					}
 				}
 				this.emitStartupProgress("Preparing IPython runtime...");
-				const bootstrap = await m.execute(buildRlmBootstrapCode(this.options?.pythonSkills), {
-					signal: startupSignal,
-				});
+				const bootstrap = await m.execute(
+					buildRlmBootstrapCode(this.options?.pythonSkills, this.options?.executionProfile),
+					{
+						signal: startupSignal,
+					},
+				);
 				if (bootstrap.status !== "ok") {
 					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
 					throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
