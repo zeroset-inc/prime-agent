@@ -934,6 +934,85 @@ describe("AgentTaskGraph", () => {
 		expect(existsSync(invalidDirectory)).toBe(false);
 	});
 
+	it("persists convergence accounting across reassignment and recovery without authorizing the old actor", () => {
+		directory = mkdtempSync(join(tmpdir(), "prime-task-convergence-"));
+		const policy = {
+			requireExclusiveClaims: true,
+			delegatedTaskConvergence: {
+				maxToolCallsWithoutEvidence: 2,
+				maxToolCallsAfterSteer: 3,
+				maxExplorationToolCalls: 6,
+			},
+		};
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review",
+				exclusiveClaims: [claim("a.ts"), claim("b.ts")],
+			},
+			policy,
+		});
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "old-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent boundary",
+			},
+		});
+		graph.startTask(child.id, "old-agent");
+		graph.updateProgress(child.id, "old-agent", {
+			summary: "First evidence",
+			evidenceRefs: ["artifact://first"],
+		});
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "old-agent", 1)).toMatchObject({
+			state: {
+				phase: "exploring",
+				explorationToolCalls: 1,
+				toolCallsWithoutEvidence: 1,
+				seenEvidenceRefs: ["artifact://first"],
+			},
+			enteredFinalizing: false,
+		});
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "old-agent", 1)).toMatchObject({
+			state: { phase: "finalizing", explorationToolCalls: 2, finalizingToolCalls: 0 },
+			enteredFinalizing: true,
+			remainingFinalizationToolCalls: 3,
+		});
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "old-agent", 1)).toMatchObject({
+			state: { phase: "finalizing", finalizingToolCalls: 1 },
+			remainingFinalizationToolCalls: 2,
+		});
+
+		graph.reassignTask(child.id, "root-agent", "replacement-agent");
+		expect(() => graph.recordDelegatedTaskConvergenceTurn(child.id, "old-agent", 1)).toThrow("does not own task");
+		expect(graph.getTask(child.id).convergence?.finalizingToolCalls).toBe(1);
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "replacement-agent", 1)).toMatchObject({
+			state: { phase: "finalizing", finalizingToolCalls: 2 },
+			remainingFinalizationToolCalls: 1,
+		});
+
+		graph.checkpoint();
+		const restored = AgentTaskGraph.open({
+			directory,
+			root: { ownerAgentId: "restored-root", objective: "Review" },
+			policy,
+		});
+		expect(restored.getTask(child.id)).toMatchObject({
+			status: "interrupted",
+			convergence: {
+				phase: "finalizing",
+				explorationToolCalls: 2,
+				finalizingToolCalls: 2,
+				seenEvidenceRefs: ["artifact://first"],
+			},
+		});
+	});
+
 	it("rejects misspelled and incomplete policy fields before creating durable state", () => {
 		const invalidDirectory = join(tmpdir(), `prime-invalid-task-policy-shape-${Date.now()}`);
 		directory = invalidDirectory;
@@ -958,7 +1037,38 @@ describe("AgentTaskGraph", () => {
 				},
 			}),
 		).toThrow("delegatedTaskConvergence.maxExplorationToolCalls must be a positive integer");
+		expect(() =>
+			AgentTaskGraph.open({
+				directory: invalidDirectory,
+				root: { ownerAgentId: "root-agent", objective: "Review" },
+				policy: { delegatedTaskConvergence: null } as never,
+			}),
+		).toThrow("delegatedTaskConvergence must be an object");
 		expect(existsSync(invalidDirectory)).toBe(false);
+	});
+
+	it("preserves causes at graph boundaries without wrapping host validators", () => {
+		const cause = new Error("underlying failure");
+		expect(new AgentTaskGraphError("outer failure", { cause }).cause).toBe(cause);
+
+		directory = mkdtempSync(join(tmpdir(), "prime-task-validator-cause-"));
+		const validatorError = new Error("host validator rejected completion");
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: { ownerAgentId: "root-agent", objective: "Review" },
+			policy: {
+				validateCompletion: () => {
+					throw validatorError;
+				},
+			},
+		});
+		let thrown: unknown;
+		try {
+			graph.completeTaskFromRuntime(graph.rootTaskId, "root-agent", "done");
+		} catch (error) {
+			thrown = error;
+		}
+		expect(thrown).toBe(validatorError);
 	});
 
 	it("publishes an immutable capability contract for policy consumers", () => {

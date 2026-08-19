@@ -67,116 +67,13 @@ except Exception as _prime_agent_rlm_error:
     rlm = _PrimeAgentMissingRlm()
 `.trim();
 
-const INSPECTION_ONLY_BOOTSTRAP_CODE = `
-import ctypes as _prime_agent_inspection_ctypes
-import errno as _prime_agent_inspection_errno
-import platform as _prime_agent_inspection_platform
-import sys as _prime_agent_inspection_sys
-
-if _prime_agent_inspection_sys.platform != "linux":
-    raise RuntimeError("inspection-only execution requires Linux seccomp enforcement")
-
-_prime_agent_inspection_machine = _prime_agent_inspection_platform.machine().lower()
-_PRIME_AGENT_INSPECTION_ARCHITECTURES = {
-    "x86_64": (0xC000003E, (59, 322, 0x4000003B, 0x40000142)),
-    "amd64": (0xC000003E, (59, 322, 0x4000003B, 0x40000142)),
-    "aarch64": (0xC00000B7, (221, 281)),
-    "arm64": (0xC00000B7, (221, 281)),
-}
-_prime_agent_inspection_arch = _PRIME_AGENT_INSPECTION_ARCHITECTURES.get(_prime_agent_inspection_machine)
-if _prime_agent_inspection_arch is None:
-    raise RuntimeError(
-        f"inspection-only execution does not support Linux architecture {_prime_agent_inspection_machine!r}"
-    )
-
-class _PrimeAgentSockFilter(_prime_agent_inspection_ctypes.Structure):
-    _fields_ = [
-        ("code", _prime_agent_inspection_ctypes.c_ushort),
-        ("jt", _prime_agent_inspection_ctypes.c_ubyte),
-        ("jf", _prime_agent_inspection_ctypes.c_ubyte),
-        ("k", _prime_agent_inspection_ctypes.c_uint32),
-    ]
-
-class _PrimeAgentSockFprog(_prime_agent_inspection_ctypes.Structure):
-    _fields_ = [
-        ("len", _prime_agent_inspection_ctypes.c_ushort),
-        ("filter", _prime_agent_inspection_ctypes.POINTER(_PrimeAgentSockFilter)),
-    ]
-
-_PRIME_AGENT_BPF_LD_W_ABS = 0x20
-_PRIME_AGENT_BPF_JMP_JEQ_K = 0x15
-_PRIME_AGENT_BPF_RET_K = 0x06
-_PRIME_AGENT_SECCOMP_RET_KILL_PROCESS = 0x80000000
-_PRIME_AGENT_SECCOMP_RET_ERRNO = 0x00050000
-_PRIME_AGENT_SECCOMP_RET_ALLOW = 0x7FFF0000
-_PRIME_AGENT_PR_SET_NO_NEW_PRIVS = 38
-_PRIME_AGENT_PR_SET_SECCOMP = 22
-_PRIME_AGENT_SECCOMP_MODE_FILTER = 2
-
-_prime_agent_inspection_audit_arch, _prime_agent_inspection_exec_syscalls = _prime_agent_inspection_arch
-_prime_agent_inspection_filter_values = [
-    (_PRIME_AGENT_BPF_LD_W_ABS, 0, 0, 4),
-    (_PRIME_AGENT_BPF_JMP_JEQ_K, 1, 0, _prime_agent_inspection_audit_arch),
-    (_PRIME_AGENT_BPF_RET_K, 0, 0, _PRIME_AGENT_SECCOMP_RET_KILL_PROCESS),
-    (_PRIME_AGENT_BPF_LD_W_ABS, 0, 0, 0),
-]
-for _prime_agent_inspection_syscall in _prime_agent_inspection_exec_syscalls:
-    _prime_agent_inspection_filter_values.extend([
-        (_PRIME_AGENT_BPF_JMP_JEQ_K, 0, 1, _prime_agent_inspection_syscall),
-        (
-            _PRIME_AGENT_BPF_RET_K,
-            0,
-            0,
-            _PRIME_AGENT_SECCOMP_RET_ERRNO | _prime_agent_inspection_errno.EPERM,
-        ),
-    ])
-_prime_agent_inspection_filter_values.append(
-    (_PRIME_AGENT_BPF_RET_K, 0, 0, _PRIME_AGENT_SECCOMP_RET_ALLOW)
-)
-_prime_agent_inspection_filters = (_PrimeAgentSockFilter * len(_prime_agent_inspection_filter_values))(
-    *(_PrimeAgentSockFilter(*value) for value in _prime_agent_inspection_filter_values)
-)
-_prime_agent_inspection_program = _PrimeAgentSockFprog(
-    len(_prime_agent_inspection_filters),
-    _prime_agent_inspection_filters,
-)
-_prime_agent_inspection_libc = _prime_agent_inspection_ctypes.CDLL(None, use_errno=True)
-if _prime_agent_inspection_libc.prctl(_PRIME_AGENT_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-    _prime_agent_inspection_error = _prime_agent_inspection_ctypes.get_errno()
-    raise RuntimeError(
-        f"inspection-only execution could not set no_new_privs: "
-        f"{_prime_agent_inspection_errno.errorcode.get(_prime_agent_inspection_error, _prime_agent_inspection_error)}"
-    )
-if _prime_agent_inspection_libc.prctl(
-    _PRIME_AGENT_PR_SET_SECCOMP,
-    _PRIME_AGENT_SECCOMP_MODE_FILTER,
-    _prime_agent_inspection_ctypes.byref(_prime_agent_inspection_program),
-) != 0:
-    _prime_agent_inspection_error = _prime_agent_inspection_ctypes.get_errno()
-    raise RuntimeError(
-        f"inspection-only execution could not install seccomp: "
-        f"{_prime_agent_inspection_errno.errorcode.get(_prime_agent_inspection_error, _prime_agent_inspection_error)}"
-    )
-
-def _prime_agent_install_inspection_audit():
-    blocked_events = frozenset({
-        "os.exec", "os.fork", "os.forkpty", "os.posix_spawn", "os.spawn", "os.system", "subprocess.Popen",
-    })
-    denied = PermissionError
-    message = "inspection-only execution profile blocks external process execution"
-    def audit(event, args, _blocked=blocked_events, _denied=denied, _message=message):
-        if event in _blocked:
-            raise _denied(_message)
-    _prime_agent_inspection_sys.addaudithook(audit)
-
-_prime_agent_install_inspection_audit()
-del _prime_agent_install_inspection_audit
+const INSPECTION_ONLY_RESTRICTION_CODE = `
+from rlm.inspection import enforce_inspection_only as _prime_agent_enforce_inspection_only
+_prime_agent_enforce_inspection_only()
+del _prime_agent_enforce_inspection_only
 `.trim();
 
-export function buildRlmBootstrapCode(
-	pythonSkills: readonly PythonSkillRuntimeInfo[] = [],
-	executionProfile?: "inspection_only",
-): string {
+export function buildRlmBootstrapCode(pythonSkills: readonly PythonSkillRuntimeInfo[] = []): string {
 	const importNames = [...new Set(pythonSkills.map((skill) => skill.importName))];
 	const skillsCode =
 		importNames.length === 0
@@ -246,7 +143,7 @@ for _prime_agent_skill_name in ${JSON.stringify(importNames)}:
             str(_prime_agent_skill_error),
         )
 `.trim();
-	return executionProfile === "inspection_only" ? `${skillsCode}\n\n${INSPECTION_ONLY_BOOTSTRAP_CODE}` : skillsCode;
+	return skillsCode;
 }
 
 const ipythonSchema = Type.Object({
@@ -617,7 +514,7 @@ export class IpythonKernelProvisioner {
 				}, startupSignal);
 				if (this.options?.executionProfile === "inspection_only") {
 					this.emitStartupProgress("Restricting IPython execution...");
-					const restriction = await m.execute(INSPECTION_ONLY_BOOTSTRAP_CODE, { signal: startupSignal });
+					const restriction = await m.execute(INSPECTION_ONLY_RESTRICTION_CODE, { signal: startupSignal });
 					if (restriction.status !== "ok") {
 						const details = [restriction.stderr, restriction.error?.traceback.join("\n")]
 							.filter(Boolean)

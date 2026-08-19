@@ -73,6 +73,21 @@ export interface AgentTaskProgress {
 	updatedAt: string;
 }
 
+export interface AgentTaskConvergenceState {
+	phase: "exploring" | "finalizing";
+	explorationToolCalls: number;
+	toolCallsWithoutEvidence: number;
+	finalizingToolCalls: number;
+	seenEvidenceRefs: string[];
+}
+
+export interface AgentTaskConvergenceUpdate {
+	state: AgentTaskConvergenceState;
+	enteredFinalizing: boolean;
+	exhausted: boolean;
+	remainingFinalizationToolCalls: number;
+}
+
 export interface AgentTaskResult {
 	summary: string;
 	verification: unknown[];
@@ -152,6 +167,7 @@ export interface AgentTask {
 	status: AgentTaskStatus;
 	delegationState: AgentTaskDelegationState;
 	progress?: AgentTaskProgress;
+	convergence?: AgentTaskConvergenceState;
 	result?: AgentTaskResult;
 	gaps: AgentTaskGap[];
 	resumeRequest?: AgentTaskResumeRequest;
@@ -263,9 +279,11 @@ export interface AgentTaskGraphPolicy {
 	 * completion fails host validation. The correction must explicitly submit
 	 * a structured result or report a gap. */
 	delegatedTaskCompletionCorrection?: boolean;
-	/** Restricts every task runtime in this graph to repository inspection.
-	 * Python remains available, but project/build subprocesses are denied by
-	 * the kernel rather than inferred from source text. */
+	/** Applies an inspection-only profile to every task session's IPython
+	 * kernel. In-process Python remains available, but external process
+	 * creation and execution are denied. Kernel startup fails closed unless
+	 * supported Linux seccomp enforcement can be installed. Other host and
+	 * extension execution surfaces are outside this profile. */
 	executionProfile?: "inspection_only";
 }
 
@@ -297,8 +315,8 @@ interface AgentTaskGraphEvent {
 const ACTIVE_TASK_STATUSES = new Set<AgentTaskStatus>(["pending", "starting", "running", "blocked"]);
 
 export class AgentTaskGraphError extends Error {
-	constructor(message: string) {
-		super(message);
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
 		this.name = "AgentTaskGraphError";
 	}
 }
@@ -912,6 +930,56 @@ export class AgentTaskGraph {
 		return { ...policy };
 	}
 
+	recordDelegatedTaskConvergenceTurn(
+		taskId: string,
+		callerAgentId: string,
+		toolCalls: number,
+	): AgentTaskConvergenceUpdate | undefined {
+		const task = this.findTask(taskId);
+		this.assertOwner(task, callerAgentId);
+		this.assertActive(task, "record convergence for");
+		const policy = this.policy.delegatedTaskConvergence;
+		if (!policy) return undefined;
+		const turnToolCalls = normalizeNonNegativeInteger(toolCalls, "convergence toolCalls");
+		const current = task.convergence ?? emptyConvergenceState();
+		const seenEvidenceRefs = new Set(current.seenEvidenceRefs);
+		let discoveredEvidence = false;
+		for (const evidenceRef of task.progress?.evidenceRefs ?? []) {
+			if (seenEvidenceRefs.has(evidenceRef)) continue;
+			seenEvidenceRefs.add(evidenceRef);
+			discoveredEvidence = true;
+		}
+		let enteredFinalizing = false;
+		const nextState: AgentTaskConvergenceState = {
+			...current,
+			seenEvidenceRefs: [...seenEvidenceRefs],
+		};
+		if (current.phase === "exploring") {
+			nextState.explorationToolCalls += turnToolCalls;
+			nextState.toolCallsWithoutEvidence =
+				(discoveredEvidence ? 0 : current.toolCallsWithoutEvidence) + turnToolCalls;
+			if (
+				nextState.toolCallsWithoutEvidence >= policy.maxToolCallsWithoutEvidence ||
+				nextState.explorationToolCalls >= policy.maxExplorationToolCalls
+			) {
+				nextState.phase = "finalizing";
+				enteredFinalizing = true;
+			}
+		} else {
+			nextState.finalizingToolCalls += turnToolCalls;
+		}
+		const exhausted =
+			nextState.phase === "finalizing" && nextState.finalizingToolCalls >= policy.maxToolCallsAfterSteer;
+		const next = touchTask({ ...task, convergence: nextState });
+		this.commit("task.convergence_recorded", callerAgentId, [next]);
+		return {
+			state: clone(nextState),
+			enteredFinalizing,
+			exhausted,
+			remainingFinalizationToolCalls: Math.max(0, policy.maxToolCallsAfterSteer - nextState.finalizingToolCalls),
+		};
+	}
+
 	allowsDelegatedTaskCompletionCorrection(taskId: string): boolean {
 		this.findTask(taskId);
 		return this.policy.delegatedTaskCompletionCorrection === true;
@@ -1031,7 +1099,9 @@ export class AgentTaskGraph {
 		this.findTask(taskId);
 		while (true) {
 			if (this.fatalError) {
-				throw new AgentTaskGraphError(`task graph durability failed: ${this.fatalError.message}`);
+				throw new AgentTaskGraphError(`task graph durability failed: ${this.fatalError.message}`, {
+					cause: this.fatalError,
+				});
 			}
 			if (options.signal?.aborted) throw new AgentTaskGraphError("task descendant wait cancelled");
 			if (!this.hasActiveDescendants(taskId)) return;
@@ -1179,7 +1249,9 @@ export class AgentTaskGraph {
 				event = JSON.parse(line) as AgentTaskGraphEvent;
 			} catch (error) {
 				if (index === lines.length - 1) break;
-				throw new AgentTaskGraphError(`invalid task graph event at line ${index + 1}: ${String(error)}`);
+				throw new AgentTaskGraphError(`invalid task graph event at line ${index + 1}: ${String(error)}`, {
+					cause: asError(error),
+				});
 			}
 			if (event.graphId !== state.graphId || event.graphVersion <= state.version) continue;
 			const tasks = new Map(state.tasks.map((task) => [task.id, task]));
@@ -1308,7 +1380,9 @@ export class AgentTaskGraph {
 		} catch (error) {
 			this.fatalError = asError(error);
 			this.notifyChangeWaiters();
-			throw new AgentTaskGraphError(`task graph journal write failed: ${this.fatalError.message}`);
+			throw new AgentTaskGraphError(`task graph journal write failed: ${this.fatalError.message}`, {
+				cause: this.fatalError,
+			});
 		}
 	}
 
@@ -1329,7 +1403,11 @@ export class AgentTaskGraph {
 			this.degradedError = undefined;
 		} catch (error) {
 			this.degradedError = asError(error);
-			if (required) throw new AgentTaskGraphError(`task graph checkpoint failed: ${this.degradedError.message}`);
+			if (required) {
+				throw new AgentTaskGraphError(`task graph checkpoint failed: ${this.degradedError.message}`, {
+					cause: this.degradedError,
+				});
+			}
 		}
 	}
 
@@ -1465,7 +1543,11 @@ export class AgentTaskGraph {
 	}
 
 	private assertWritable(): void {
-		if (this.fatalError) throw new AgentTaskGraphError(`task graph durability failed: ${this.fatalError.message}`);
+		if (this.fatalError) {
+			throw new AgentTaskGraphError(`task graph durability failed: ${this.fatalError.message}`, {
+				cause: this.fatalError,
+			});
+		}
 	}
 }
 
@@ -1611,7 +1693,10 @@ function normalizeText(value: string, field: string, maxLength = AGENT_TASK_TEXT
 }
 
 function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined): AgentTaskGraphPolicy {
-	if (!policy) return {};
+	if (policy === undefined) return {};
+	if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
+		throw new AgentTaskGraphError("task graph policy must be an object");
+	}
 	assertExactObjectKeys(policy, "task graph policy", [
 		"requireExclusiveClaims",
 		"validateDelegation",
@@ -1629,7 +1714,10 @@ function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined)
 		}
 	}
 	const convergence = policy.delegatedTaskConvergence;
-	if (convergence) {
+	if (convergence !== undefined) {
+		if (!convergence || typeof convergence !== "object" || Array.isArray(convergence)) {
+			throw new AgentTaskGraphError("delegatedTaskConvergence must be an object");
+		}
 		assertExactObjectKeys(convergence, "delegatedTaskConvergence", [
 			"maxToolCallsWithoutEvidence",
 			"maxToolCallsAfterSteer",
@@ -1657,7 +1745,7 @@ function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined)
 	}
 	return {
 		...policy,
-		...(convergence ? { delegatedTaskConvergence: { ...convergence } } : {}),
+		...(convergence !== undefined ? { delegatedTaskConvergence: { ...convergence } } : {}),
 	};
 }
 
@@ -1743,12 +1831,45 @@ function addUsage(current: AgentTaskUsage, delta: AgentTaskUsage): AgentTaskUsag
 function normalizeUsageAttributions(task: AgentTask): AgentTask {
 	return {
 		...task,
+		...(task.convergence ? { convergence: normalizeConvergenceState(task.convergence) } : {}),
 		usageAttributions: Array.isArray(task.usageAttributions)
 			? task.usageAttributions.map((attribution) => ({
 					...attribution,
 					...normalizeUsageAttribution(attribution),
 				}))
 			: [],
+	};
+}
+
+function emptyConvergenceState(): AgentTaskConvergenceState {
+	return {
+		phase: "exploring",
+		explorationToolCalls: 0,
+		toolCallsWithoutEvidence: 0,
+		finalizingToolCalls: 0,
+		seenEvidenceRefs: [],
+	};
+}
+
+function normalizeConvergenceState(state: AgentTaskConvergenceState): AgentTaskConvergenceState {
+	if (state.phase !== "exploring" && state.phase !== "finalizing") {
+		throw new AgentTaskGraphError(`unsupported task convergence phase: ${String(state.phase)}`);
+	}
+	return {
+		phase: state.phase,
+		explorationToolCalls: normalizeNonNegativeInteger(
+			state.explorationToolCalls,
+			"task convergence explorationToolCalls",
+		),
+		toolCallsWithoutEvidence: normalizeNonNegativeInteger(
+			state.toolCallsWithoutEvidence,
+			"task convergence toolCallsWithoutEvidence",
+		),
+		finalizingToolCalls: normalizeNonNegativeInteger(
+			state.finalizingToolCalls,
+			"task convergence finalizingToolCalls",
+		),
+		seenEvidenceRefs: normalizeStringList(state.seenEvidenceRefs, "task convergence seenEvidenceRefs"),
 	};
 }
 
@@ -1839,7 +1960,7 @@ function parseSnapshot(raw: string): AgentTaskGraphSnapshot {
 	try {
 		value = JSON.parse(raw);
 	} catch (error) {
-		throw new AgentTaskGraphError(`invalid task graph snapshot: ${String(error)}`);
+		throw new AgentTaskGraphError(`invalid task graph snapshot: ${String(error)}`, { cause: asError(error) });
 	}
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
 		throw new AgentTaskGraphError("task graph snapshot must be an object");
@@ -1869,7 +1990,9 @@ function assertJsonSize(value: unknown, field: string, maximum: number): void {
 	try {
 		encoded = JSON.stringify(value);
 	} catch (error) {
-		throw new AgentTaskGraphError(`${field} must be JSON serializable: ${String(error)}`);
+		throw new AgentTaskGraphError(`${field} must be JSON serializable: ${String(error)}`, {
+			cause: asError(error),
+		});
 	}
 	if (Buffer.byteLength(encoded, "utf8") > maximum) {
 		throw new AgentTaskGraphError(`${field} must be at most ${maximum} UTF-8 bytes`);
