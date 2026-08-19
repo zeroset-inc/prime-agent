@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added policy-driven evidence convergence steering and a bounded structured-completion repair turn for delegated tasks.
+
 ## [0.7.11] - 2026-08-18
 
 - Added stable root/child roles to durable model-usage attribution so session replacement cannot relabel historical root calls as child work.

@@ -276,6 +276,7 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import {
 	type AgentTaskDelegationInput,
 	type AgentTaskGraph,
+	AgentTaskGraphError,
 	type AgentTaskResult,
 	type AgentTaskResumeDispatch,
 	formatAgentTaskContextEnvelope,
@@ -10360,6 +10361,9 @@ export class AgentSession {
 		let toolUseCount = 0;
 		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
+		let toolCallsWithoutEvidence = 0;
+		let lastConvergenceEvidence = "[]";
+		let convergenceSteeredForEvidence: string | undefined;
 		let childSession: AgentSession | undefined;
 		const startupAbortController = new AbortController();
 		const run: RlmChildRun = {
@@ -10525,6 +10529,33 @@ export class AgentSession {
 					} else if (event.type === "tool_execution_end") {
 						runningToolCount = Math.max(0, runningToolCount - 1);
 						if (runningToolCount === 0) activity = { kind: "waiting" };
+						if (delegatedTaskId && this._taskGraph) {
+							const policy = this._taskGraph.delegatedTaskConvergence(delegatedTaskId);
+							if (policy) {
+								const task = this._taskGraph.getTask(delegatedTaskId);
+								const evidence = JSON.stringify(task.progress?.evidenceRefs ?? []);
+								if (evidence !== lastConvergenceEvidence) {
+									lastConvergenceEvidence = evidence;
+									toolCallsWithoutEvidence = 0;
+									convergenceSteeredForEvidence = undefined;
+								}
+								toolCallsWithoutEvidence += 1;
+								if (
+									convergenceSteeredForEvidence !== evidence &&
+									toolCallsWithoutEvidence >= policy.maxToolCallsWithoutEvidence
+								) {
+									convergenceSteeredForEvidence = evidence;
+									child.requestAbort();
+									void child
+										.steer(
+											"You have reached this task's evidence-convergence boundary without recording new durable evidence. Stop broad exploration now. Record supported evidence with rlm.task.update, then submit the bounded structured conclusion. Report a precise gap if the task cannot be completed.",
+											undefined,
+											{ queueKey: `task-convergence:${delegatedTaskId}:${evidence}`, resumeIfIdle: true },
+										)
+										.catch(() => undefined);
+								}
+							}
+						}
 						emitChildUpdate();
 					} else if (event.type === "session_info_changed" || event.type === "recap_update") {
 						emitChildUpdate();
@@ -10562,19 +10593,40 @@ export class AgentSession {
 				});
 				await child.waitForQuiescence({ signal: startupAbortController.signal });
 				if (run.error) throw new Error(run.error);
-				run.status = "done";
 				let suppressTerminalMessage = false;
 				if (delegatedTaskId && this._taskGraph) {
 					const stillOwned = this._taskGraph.getTask(delegatedTaskId).ownerAgentId === childNodeId;
 					if (stillOwned && this._taskGraph.canAutoCompleteTask(delegatedTaskId)) {
-						this._taskGraph.completeTaskFromRuntime(
-							delegatedTaskId,
-							childNodeId,
-							child.getLastAssistantText() ?? "Task completed without a textual result.",
-						);
+						try {
+							this._taskGraph.completeTaskFromRuntime(
+								delegatedTaskId,
+								childNodeId,
+								child.getLastAssistantText() ?? "Task completed without a textual result.",
+							);
+						} catch (error) {
+							if (!(error instanceof AgentTaskGraphError)) throw error;
+							const envelope = this._taskGraph.contextEnvelope(delegatedTaskId);
+							const repair = [
+								"[task completion repair]",
+								"Your investigation produced a conclusion, but its structured task completion was rejected.",
+								`Validation error: ${error.message}`,
+								`Required result schema: ${JSON.stringify(envelope.resultSchema ?? {})}`,
+								"Do not continue exploring. Reformat existing evidence and call rlm.task.complete exactly once. If required evidence is genuinely missing, call rlm.task.report_gap instead.",
+							].join("\n\n");
+							await child.promptAndWait(repair, { expandPromptTemplates: false, source: "extension" });
+							await child.waitForQuiescence({ signal: startupAbortController.signal });
+							if (this._taskGraph.canAutoCompleteTask(delegatedTaskId)) {
+								this._taskGraph.completeTaskFromRuntime(
+									delegatedTaskId,
+									childNodeId,
+									child.getLastAssistantText() ?? "Task completion repair returned no text.",
+								);
+							}
+						}
 					}
 					suppressTerminalMessage = this._hasPendingCoalescedDelegatedCompletionWait();
 				}
+				run.status = "done";
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
 				emitChildUpdate();

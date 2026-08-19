@@ -246,6 +246,11 @@ export interface AgentTaskGraphPolicy {
 	requireExclusiveClaims?: boolean;
 	validateDelegation?: (request: AgentTaskDelegationValidationRequest) => void;
 	validateCompletion?: (request: AgentTaskCompletionValidationRequest) => void;
+	/** Optional host policy for long-running delegated tasks. Prime observes
+	 * durable evidence progress rather than imposing a task token budget. */
+	delegatedTaskConvergence?: {
+		maxToolCallsWithoutEvidence: number;
+	};
 }
 
 export interface OpenAgentTaskGraphOptions {
@@ -865,6 +870,18 @@ export class AgentTaskGraph {
 			!task.gaps.some((gap) => gap.status === "open") &&
 			!this.childrenOf(task.id).some((child) => ACTIVE_TASK_STATUSES.has(child.status))
 		);
+	}
+
+	delegatedTaskConvergence(taskId: string): { maxToolCallsWithoutEvidence: number } | undefined {
+		this.findTask(taskId);
+		const policy = this.policy.delegatedTaskConvergence;
+		if (!policy) return undefined;
+		if (!Number.isSafeInteger(policy.maxToolCallsWithoutEvidence) || policy.maxToolCallsWithoutEvidence < 1) {
+			throw new AgentTaskGraphError(
+				"delegatedTaskConvergence.maxToolCallsWithoutEvidence must be a positive integer",
+			);
+		}
+		return { ...policy };
 	}
 
 	interruptTask(taskId: string, callerAgentId: string, reason: string): AgentTask {

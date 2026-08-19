@@ -40,7 +40,7 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager, type SettingsStorage } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
-import { AgentTaskGraph } from "../src/core/task-graph.js";
+import { AgentTaskGraph, AgentTaskGraphError } from "../src/core/task-graph.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.js";
@@ -771,6 +771,138 @@ describe("AgentSession rlm recursion", () => {
 		await expect(handlers["rlm.task.current"]?.({})).resolves.toMatchObject({
 			task: { id: spawned.task_id, status: "completed" },
 		});
+	});
+
+	it("gives a rejected delegated completion one formatting-only repair turn", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "completion-repair-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "completion-repair-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: {
+				requireExclusiveClaims: true,
+				validateCompletion: ({ task, result }) => {
+					if (task.parentTaskId && !result.summary.includes("structured")) {
+						throw new AgentTaskGraphError("summary must contain structured");
+					}
+				},
+			},
+		});
+		const prompts: string[] = [];
+		const root = createSession({
+			sessionManager,
+			maxDepth: 2,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+			streamFn: (_model, context) => {
+				const prompt = userText(context);
+				prompts.push(prompt);
+				return streamAnswer(
+					prompt.includes("[task completion repair]") ? "structured conclusion" : "useful conclusion",
+				);
+			},
+		});
+
+		const spawned = await root.delegateRlmChild("Review runtime", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			resultSchema: { summary: "string" },
+			delegationReason: "Independent runtime boundary",
+		});
+
+		await waitFor(() => graph.getTask(spawned.task_id!).status === "completed");
+		expect(graph.getTask(spawned.task_id!).result?.summary).toBe("structured conclusion");
+		const repairPrompts = prompts.filter((prompt) => prompt.includes("[task completion repair]"));
+		expect(repairPrompts).toHaveLength(1);
+		expect(repairPrompts[0]).toContain("Validation error: summary must contain structured");
+		expect(repairPrompts[0]).toContain('Required result schema: {"summary":"string"}');
+	});
+
+	it("steers delegated exploration after the host evidence boundary", async () => {
+		const tool = {
+			name: "inspect",
+			description: "Inspect repository state",
+			label: "inspect",
+			parameters: Type.Object({ query: Type.String() }),
+			execute: async (_toolCallId: string, params: { query: string }) => ({
+				content: [{ type: "text" as const, text: params.query }],
+				details: {},
+			}),
+		};
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "convergence-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "convergence-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "installer.ts" },
+				],
+			},
+			policy: {
+				requireExclusiveClaims: true,
+				delegatedTaskConvergence: { maxToolCallsWithoutEvidence: 2 },
+			},
+		});
+		let toolSequence = 0;
+		let sawConvergencePrompt = false;
+		const root = createSession({
+			sessionManager,
+			maxDepth: 2,
+			customTools: [tool],
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+			streamFn: (_model, context) => {
+				const prompt = userText(context);
+				if (prompt.includes("evidence-convergence boundary")) {
+					sawConvergencePrompt = true;
+					return streamAnswer("bounded conclusion");
+				}
+				toolSequence += 1;
+				if (toolSequence > 6) return streamAnswer("fallback conclusion");
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() =>
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: {
+							...assistantMessage(""),
+							content: [
+								{
+									type: "toolCall" as const,
+									id: `inspect-${toolSequence}`,
+									name: "inspect",
+									arguments: { query: "same evidence" },
+								},
+							],
+							stopReason: "toolUse" as const,
+						},
+					}),
+				);
+				return stream;
+			},
+		});
+
+		const spawned = await root.delegateRlmChild("Review runtime", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			delegationReason: "Independent runtime boundary",
+		});
+
+		await waitFor(() => graph.getTask(spawned.task_id!).status === "completed");
+		expect(sawConvergencePrompt).toBe(true);
+		expect(graph.getTask(spawned.task_id!).result?.summary).toBe("bounded conclusion");
+		const child = root.getRlmChildSession(spawned.rlm_child_id);
+		expect(child?.messages.filter((message) => message.role === "toolResult").length).toBeLessThanOrEqual(3);
 	});
 
 	it("records provider-reported usage from an aborted task call", async () => {
