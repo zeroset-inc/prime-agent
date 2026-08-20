@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.12] - 2026-08-19
+
 - Added durable graph-scoped delegated-task convergence with an absolute exploration ceiling that survives task reassignment and recovery.
 - Added a structured-completion correction that host-preserves the rejected conclusion and durable evidence, permits validators to reject only mutable structured fields, and allows at most three task-action attempts in one bounded turn.
 - Added a graph-scoped Linux task-kernel execution profile that fails closed unless seccomp can block execve/execveat and ptrace/process_vm_* cross-process memory syscalls.
