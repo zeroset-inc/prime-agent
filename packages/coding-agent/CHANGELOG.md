@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Fixed failed or cancelled recursive child runs deadlocking headless quiescence by making terminal settlement failure-atomic, admitting lifecycle notices as parent-owned durable work, and reaping host cleanup independently with a bounded deadline.
+- Fixed failed or cancelled recursive child runs causing headless sessions to hang indefinitely.
 
 ## [0.7.12] - 2026-08-19
 
