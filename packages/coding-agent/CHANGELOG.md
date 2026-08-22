@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fixed failed or cancelled recursive child runs causing headless sessions to hang indefinitely.
+- Fixed GitHub beta releases missing the immutable package artifacts required for installation.
 
 ## [0.7.12] - 2026-08-19
 
