@@ -2143,11 +2143,12 @@ describe("AgentSession rlm recursion", () => {
 		);
 	});
 
-	it("delivers an id-addressed send while a completed child's terminal injection is pending", async () => {
-		let releaseTerminalInjection: () => void = () => {};
-		const terminalInjectionGate = new Promise<void>((resolve) => {
-			releaseTerminalInjection = resolve;
+	it("delivers an id-addressed send while a completed child's durable terminal turn is pending", async () => {
+		let releaseTerminalTurn: () => void = () => {};
+		const terminalTurnGate = new Promise<void>((resolve) => {
+			releaseTerminalTurn = resolve;
 		});
+		let terminalTurnStarted = false;
 		const child = createSession({ rlmSessionDir: join(tempDir, "completed-child") });
 		const sendAgentMessage = vi.fn(async (input: { target: string; message: string }) => ({
 			id: "agentmsg-completed-child",
@@ -2157,6 +2158,14 @@ describe("AgentSession rlm recursion", () => {
 			deliveryStatus: "delivered" as const,
 		}));
 		const root = createSession({
+			streamFn: () => {
+				terminalTurnStarted = true;
+				const stream = createAssistantMessageEventStream();
+				void terminalTurnGate.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("terminal notice handled") });
+				});
+				return stream;
+			},
 			agentMessageController: {
 				listAgents: () => ({ agents: [] }),
 				roster: () => ({
@@ -2178,13 +2187,9 @@ describe("AgentSession rlm recursion", () => {
 				deleteRlmSubagentRuntime: async (_id, session) => session?.disposeAsync(),
 			},
 		});
-		const promptInjectedMessage = vi.fn(async () => terminalInjectionGate);
-		(root as unknown as { _promptInjectedMessage: typeof promptInjectedMessage })._promptInjectedMessage =
-			promptInjectedMessage;
 		const spawned = await root.runRlmChild("completed task", { name: "completed-worker" });
 		const internals = root as unknown as InspectableRlmSession;
-		await waitFor(() => internals._activeRlmChildRuns.get(spawned.rlm_child_id)?.status === "done");
-		await waitFor(() => promptInjectedMessage.mock.calls.length === 1);
+		await waitFor(() => terminalTurnStarted);
 		const send = internals._createKernelHostHandlers()["agent_message.send"];
 		if (!send) throw new Error("Missing agent_message.send host handler");
 
@@ -2195,7 +2200,7 @@ describe("AgentSession rlm recursion", () => {
 			expect.objectContaining({ target: child.sessionId, message: "follow-up" }),
 		);
 
-		releaseTerminalInjection();
+		releaseTerminalTurn();
 		await waitFor(() => !internals._activeRlmChildRuns.has(spawned.rlm_child_id));
 	});
 
@@ -2798,6 +2803,105 @@ describe("AgentSession rlm recursion", () => {
 				"error",
 			);
 		});
+	});
+
+	it("settles a failed child before publishing its terminal update", async () => {
+		const sendAgentMessage = vi.fn(() => new Promise<never>(() => {}));
+		const child = createSession({
+			rlmSessionDir: join(tempDir, "terminal-settlement-child"),
+			agentMessageController: {
+				listAgents: () => ({ agents: [] }),
+				roster: () => ({
+					current: { name: "terminal-worker", id: "terminal-worker", depth: 1 },
+					entries: [],
+				}),
+				sendAgentMessage,
+			},
+		});
+		vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child prompt failed"));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				releaseRlmSubagentRuntime: async () => {},
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		const internals = root as unknown as InspectableRlmSession;
+		let settledAtTerminalUpdate: boolean | undefined;
+		const unsubscribe = root.subscribe((event) => {
+			if (event.type !== "rlm_child_update" || event.child.status !== "error") return;
+			settledAtTerminalUpdate = internals._activeRlmChildRuns.get(event.child.id)?.settled;
+		});
+
+		await root.runRlmChild("fail without transport coupling", { name: "terminal-worker" });
+		await vi.waitFor(() => expect(settledAtTerminalUpdate).toBe(true));
+		await expectSettlesWithin(root.waitForQuiescence(), 1000);
+		expect(sendAgentMessage).not.toHaveBeenCalled();
+		unsubscribe();
+	});
+
+	it("does not let a wedged runtime release hold child quiescence open", async () => {
+		const child = createSession({ rlmSessionDir: join(tempDir, "wedged-release-child") });
+		vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child prompt failed"));
+		const releaseRlmSubagentRuntime = vi.fn(() => new Promise<void>(() => {}));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				releaseRlmSubagentRuntime,
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+
+		const spawned = await root.runRlmChild("fail before wedged cleanup");
+		await vi.waitFor(() => {
+			expect((root as unknown as InspectableRlmSession)._activeRlmChildRuns.get(spawned.rlm_child_id)?.settled).toBe(
+				true,
+			);
+			expect(releaseRlmSubagentRuntime).toHaveBeenCalled();
+		});
+		await expectSettlesWithin(root.waitForQuiescence(), 1000);
+	});
+
+	it("converts a host completion failure before admitting the terminal notice", async () => {
+		const child = createSession({ rlmSessionDir: join(tempDir, "completion-failure-child") });
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				completeRlmSubagentRuntime: () => {
+					throw new Error("completion persistence failed");
+				},
+				releaseRlmSubagentRuntime: async () => {},
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		const internals = root as unknown as InspectableRlmSession;
+		let terminalStatus: string | undefined;
+		let settledAtTerminalUpdate: boolean | undefined;
+		root.subscribe((event) => {
+			if (event.type !== "rlm_child_update" || (event.child.status !== "done" && event.child.status !== "error")) {
+				return;
+			}
+			terminalStatus = event.child.status;
+			settledAtTerminalUpdate = internals._activeRlmChildRuns.get(event.child.id)?.settled;
+		});
+
+		await root.runRlmChild("finish before persistence");
+		await vi.waitFor(() => expect(terminalStatus).toBe("error"));
+		expect(settledAtTerminalUpdate).toBe(true);
+		await expectSettlesWithin(root.waitForQuiescence(), 1000);
+		expect(
+			root.messages.some(
+				(message) =>
+					message.role === "custom" &&
+					message.customType === "rlm_child_failure" &&
+					String(message.content).includes("completion persistence failed"),
+			),
+		).toBe(true);
+		expect(
+			root.messages.some(
+				(message) => message.role === "custom" && message.customType === "rlm_child_terminal_notice",
+			),
+		).toBe(false);
 	});
 
 	it("notifies the runtime host when the initial child task completes", async () => {
@@ -4030,12 +4134,21 @@ describe("AgentSession rlm recursion", () => {
 		expect(internals._rlmChildCleanupFailures.size).toBe(0);
 	});
 
-	it("reserves an errored startup name while its detached failure injection settles", async () => {
-		let releaseFailureInjection: () => void = () => {};
-		const failureInjectionGate = new Promise<void>((resolve) => {
-			releaseFailureInjection = resolve;
+	it("decouples an errored startup name from its durable failure turn", async () => {
+		let releaseFailureTurn: () => void = () => {};
+		const failureTurnGate = new Promise<void>((resolve) => {
+			releaseFailureTurn = resolve;
 		});
+		let failureTurnStarted = false;
 		const root = createSession({
+			streamFn: () => {
+				failureTurnStarted = true;
+				const stream = createAssistantMessageEventStream();
+				void failureTurnGate.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage("failure notice handled") });
+				});
+				return stream;
+			},
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => {
 					throw new Error("startup failed");
@@ -4043,27 +4156,19 @@ describe("AgentSession rlm recursion", () => {
 				deleteRlmSubagentRuntime: async () => undefined,
 			},
 		});
-		const promptInjectedMessage = vi.fn(async () => failureInjectionGate);
-		(root as unknown as { _promptInjectedMessage: typeof promptInjectedMessage })._promptInjectedMessage =
-			promptInjectedMessage;
 
 		await root.runRlmChild("failing startup", { name: "failed-worker" });
-		await waitFor(() => promptInjectedMessage.mock.calls.length === 1);
+		await waitFor(() => failureTurnStarted);
 		const failed = (await root.listRlmSubagents()).subagents[0];
 		expect(failed).toMatchObject({ session_name: "failed-worker", status: "error" });
 		await expect(root.deleteRlmSubagent("failed-worker")).resolves.toEqual({ subagent: failed });
 		const internals = root as unknown as InspectableRlmSession;
-		expect(internals._activeRlmChildRuns.size).toBe(1);
+		expect(internals._activeRlmChildRuns.size).toBe(0);
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
-		await expect(root.runRlmChild("replacement", { name: "failed-worker" })).rejects.toThrow(
-			"an agent of that name already exists at depth 1 under this parent",
-		);
-
-		releaseFailureInjection();
-		await waitFor(() => !internals._activeRlmChildRuns.has(failed?.rlm_child_id ?? ""));
 		await expect(root.runRlmChild("replacement", { name: "failed-worker" })).resolves.toMatchObject({
 			name: "failed-worker",
 		});
+		releaseFailureTurn();
 	});
 
 	it("reserves a deleted queued child's name until startup settles", async () => {

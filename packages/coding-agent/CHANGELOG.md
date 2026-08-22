@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed failed or cancelled recursive child runs deadlocking headless quiescence by making terminal settlement failure-atomic, admitting lifecycle notices as parent-owned durable work, and reaping host cleanup independently with a bounded deadline.
+
 ## [0.7.12] - 2026-08-19
 
 - Added durable graph-scoped delegated-task convergence with an absolute exploration ceiling that survives task reassignment and recovery.
