@@ -984,8 +984,8 @@ interface RlmChildRun {
 	session?: AgentSession;
 	/** True once the semantic child join is terminal; physical cleanup is tracked separately. */
 	settled: boolean;
-	/** True once publication of this run's synthesized terminal notice has been scheduled. */
-	terminalNoticeScheduled?: boolean;
+	/** Final disposition prevents detached completion from retrying a notice after deliberate suppression. */
+	terminalNoticeDisposition?: "scheduled" | "suppressed";
 	/** Detached execution body, used to join bounded cancellation termination. */
 	execution?: Promise<void>;
 	/** True once bounded cancellation termination has been registered. */
@@ -4285,6 +4285,9 @@ export class AgentSession {
 		for (const session of this._rlmChildSessions.values()) {
 			await session.disposeAsync().catch(() => undefined);
 		}
+		// Drain to a fixed point: cancellation can let detached execution enqueue
+		// cleanup while termination is being drained. Disposal closes new admissions;
+		// keyed cleanup and per-run termination are single-flight and bounded.
 		while (
 			this._rlmChildTerminationOperations.size > 0 ||
 			this._rlmChildCleanupOperations.size > 0 ||
@@ -9780,7 +9783,7 @@ export class AgentSession {
 
 	private _cancelActiveRlmChildRuns(reason: string): void {
 		for (const run of this._activeRlmChildRuns.values()) {
-			this._cancelRlmChildRun(run, reason);
+			this._cancelRlmChildRun(run, reason, { suppressTerminalNotice: true });
 		}
 	}
 
@@ -9790,6 +9793,8 @@ export class AgentSession {
 		childSession?: AgentSession,
 		sessionName?: string,
 	): void {
+		// Abort and update restart reject private derived work. These checks are
+		// race backstops for suspension beginning around the admission fence.
 		if (this._disposed || this._disposing || this._sessionInputPumpSuspended) return;
 		const operation = (async () => {
 			let publicationMessage = message;
@@ -9970,8 +9975,12 @@ export class AgentSession {
 			const taskError = error instanceof Error ? error.message : String(error);
 			run.error = `${run.error ?? reason} (completion wait: ${taskError})`;
 		}
-		if (!suppressTerminalNotice && !run.detachedDeletion && !suppressForDelegatedCompletion) {
-			run.terminalNoticeScheduled = true;
+		const terminalNoticeSuppressed =
+			suppressTerminalNotice || run.detachedDeletion !== undefined || suppressForDelegatedCompletion;
+		if (!run.terminalNoticeDisposition && terminalNoticeSuppressed) {
+			run.terminalNoticeDisposition = "suppressed";
+		} else if (!run.terminalNoticeDisposition) {
+			run.terminalNoticeDisposition = "scheduled";
 			this._scheduleRlmChildTerminalNotice(
 				createRlmChildTerminalNoticeMessage({
 					kind: "cancelled",
@@ -10771,8 +10780,8 @@ export class AgentSession {
 		};
 
 		const admitTerminalMessageToParent = (message: CustomMessage): void => {
-			if (run.terminalNoticeScheduled) return;
-			run.terminalNoticeScheduled = true;
+			if (run.terminalNoticeDisposition) return;
+			run.terminalNoticeDisposition = "scheduled";
 			this._scheduleRlmChildTerminalNotice(message, childSession, sessionName);
 		};
 

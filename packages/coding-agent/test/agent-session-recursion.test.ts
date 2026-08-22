@@ -2654,6 +2654,12 @@ describe("AgentSession rlm recursion", () => {
 			expect((root as unknown as InspectableRlmSession)._rlmChildTerminationOperations.size).toBe(0);
 		});
 		expect(providerCalls).toBe(0);
+		expect(root.getSessionActionRecoverySnapshot().actions).toEqual([]);
+		expect(
+			root.messages.some(
+				(message) => isAgentSessionMessage(message) && message.details.fromRelationship === "child",
+			),
+		).toBe(false);
 	});
 
 	it("waits for bounded child termination before reporting quiescence", async () => {
