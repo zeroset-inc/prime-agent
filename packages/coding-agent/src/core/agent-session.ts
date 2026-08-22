@@ -65,6 +65,8 @@ import {
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	createAgentMessageHostHandlers,
+	createAgentSessionMessage,
+	createAgentSessionMessageId,
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 	normalizeAgentSessionMessage,
@@ -975,13 +977,19 @@ interface RlmChildRun {
 	status: RlmChildAgentStatus;
 	error?: string;
 	failure?: Error;
-	abort: () => void;
+	abort: () => void | Promise<void>;
 	publication: AgentMessageDeferred;
 	settlement: AgentMessageDeferred;
 	/** Child session, once its runtime exists. Used to cancel nested child runs. */
 	session?: AgentSession;
-	/** True once the detached run task has finished its catch and cleanup paths. */
+	/** True once the semantic child join is terminal; physical cleanup is tracked separately. */
 	settled: boolean;
+	/** True once publication of this run's synthesized terminal notice has been scheduled. */
+	terminalNoticeScheduled?: boolean;
+	/** Detached execution body, used to join bounded cancellation termination. */
+	execution?: Promise<void>;
+	/** True once bounded cancellation termination has been registered. */
+	terminationScheduled?: boolean;
 	/** Selector snapshot for a delete admitted while runtime startup was still pending. */
 	detachedDeletion?: RlmSubagentRegistryEntry;
 	/** Re-emits the run's rlm_child_update snapshot with its current status. */
@@ -1004,6 +1012,9 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+/** Cleanup is best-effort and must never hold semantic child settlement open indefinitely. */
+const RLM_CHILD_CLEANUP_TIMEOUT_MS = 30_000;
+const RLM_CHILD_TERMINATION_TIMEOUT_MS = 30_000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 const AGENT_TASK_RESUME_CUSTOM_TYPE = "agent_task_resume";
 const AGENT_TASK_CONTROL_CUSTOM_TYPE = "agent_task_control";
@@ -1345,6 +1356,12 @@ export class AgentSession {
 	// Failed explicit deletes stay hidden from listings but retain their original
 	// selector so a later delete can retry cleanup without orphaning the runtime.
 	private _rlmChildCleanupFailures = new Map<string, RlmSubagentRegistryEntry>();
+	/** Keyed physical cleanup; excluded from semantic quiescence but drained by graceful disposal. */
+	private readonly _rlmChildCleanupOperations = new Map<string, Promise<void>>();
+	/** Fenced lifecycle-notice publication, joined by quiescence without holding child settlement open. */
+	private readonly _rlmTerminalNoticeOperations = new Set<Promise<void>>();
+	/** Bounded cancellation joins that prevent late child events after quiescence. */
+	private readonly _rlmChildTerminationOperations = new Set<Promise<void>>();
 	private _deletingRlmChildren = new Map<
 		string,
 		{
@@ -4253,6 +4270,7 @@ export class AgentSession {
 	}
 
 	private async _disposeAsyncOnce(): Promise<void> {
+		this._cancelActiveRlmChildRuns("Parent session disposed");
 		// Flush kernels/traces for both still-running and retained children; the sync
 		// dispose() below only tears them down synchronously.
 		for (const run of this._activeRlmChildRuns.values()) {
@@ -4266,6 +4284,18 @@ export class AgentSession {
 		this._rlmChildUnsubscribes.clear();
 		for (const session of this._rlmChildSessions.values()) {
 			await session.disposeAsync().catch(() => undefined);
+		}
+		while (
+			this._rlmChildTerminationOperations.size > 0 ||
+			this._rlmChildCleanupOperations.size > 0 ||
+			this._rlmTerminalNoticeOperations.size > 0
+		) {
+			await Promise.allSettled([
+				...this._rlmChildTerminationOperations,
+				...this._rlmChildCleanupOperations.values(),
+				...this._rlmTerminalNoticeOperations,
+			]);
+			await Promise.resolve();
 		}
 		this._rlmChildSessions.clear();
 		this._rlmChildCleanupFailures.clear();
@@ -6924,7 +6954,9 @@ export class AgentSession {
 				[...this._rlmChildSessions.values()].filter((child) => !child._disposed && !child._disposing),
 			);
 			for (const run of this._activeRlmChildRuns.values()) {
-				if (run.session && !run.session._disposed && !run.session._disposing) children.add(run.session);
+				if (!run.settled && run.session && !run.session._disposed && !run.session._disposing) {
+					children.add(run.session);
+				}
 			}
 			await Promise.all([...children].map((child) => child.waitForQuiescence({ signal })));
 			while (this._postCompactionContinuationScheduled || this._postCompactionContinuationOperation) {
@@ -6935,6 +6967,8 @@ export class AgentSession {
 				this._retryPromise,
 				this._bashDrainPromise,
 				...this._autoRefineOperations,
+				...this._rlmTerminalNoticeOperations,
+				...this._rlmChildTerminationOperations,
 			].filter((operation): operation is Promise<void> => operation !== undefined);
 			await Promise.all(
 				detachedOperations.map((operation) =>
@@ -6960,6 +6994,8 @@ export class AgentSession {
 				!this._bashDrainPromise &&
 				this._scheduledAutoRefineTimers.size === 0 &&
 				this._autoRefineOperations.size === 0 &&
+				this._rlmTerminalNoticeOperations.size === 0 &&
+				this._rlmChildTerminationOperations.size === 0 &&
 				(!this._taskGraph || !this._taskId || !this._taskGraph.hasActiveDescendants(this._taskId))
 			) {
 				return;
@@ -9748,21 +9784,213 @@ export class AgentSession {
 		}
 	}
 
-	private _cancelRlmChildRun(run: RlmChildRun, reason: string, preserveTask = false): boolean {
+	/** Publish lifecycle notices as fenced parent work without coupling them to child settlement. */
+	private _scheduleRlmChildTerminalNotice(
+		message: CustomMessage,
+		childSession?: AgentSession,
+		sessionName?: string,
+	): void {
+		if (this._disposed || this._disposing || this._sessionInputPumpSuspended) return;
+		const operation = (async () => {
+			let publicationMessage = message;
+			if (childSession) {
+				const normalized = normalizeMessageContent(message.content);
+				publicationMessage = createAgentSessionMessage({
+					id: createAgentSessionMessageId(),
+					source: "agent_message",
+					message: normalized.text,
+					from: {
+						activeSessionId: childSession.sessionId,
+						sessionId: childSession.sessionId,
+						sessionName: childSession.sessionName ?? sessionName,
+					},
+					fromRelationship: "child",
+					target: {
+						activeSessionId: this.sessionId,
+						sessionId: this.sessionId,
+						...(this.sessionName ? { sessionName: this.sessionName } : {}),
+					},
+				});
+			}
+			const fence = await this._acquireDirectTurnAdmissionFence(
+				this._sessionActionCommitDisposeAbortController.signal,
+			).catch(() => undefined);
+			if (!fence) return;
+			let admitted = false;
+			try {
+				if (this._disposed || this._disposing || this._sessionInputPumpSuspended) return;
+				const normalized = normalizeMessageContent(publicationMessage.content);
+				const action = this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
+					message: publicationMessage,
+					suppressAutonomousContinuation: true,
+					source: "internal",
+					executionPolicy: this._turnExecutionPolicy("injected"),
+					queueVisible: false,
+				});
+				this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
+				admitted = this._admitSessionInput(action, {
+					immediatelyEligible: this._canStartSessionActionImmediately(),
+					wake: false,
+				}).accepted;
+			} finally {
+				fence.release();
+			}
+			if (admitted) this._scheduleSessionInputPump();
+		})();
+		let tracked!: Promise<void>;
+		tracked = operation
+			.catch(() => undefined)
+			.finally(() => {
+				this._rlmTerminalNoticeOperations.delete(tracked);
+				this._notifyQuiescenceChange();
+			});
+		this._rlmTerminalNoticeOperations.add(tracked);
+		this._notifyQuiescenceChange();
+	}
+
+	/** Resolve the semantic join exactly once, before publishing a terminal snapshot. */
+	private _settleRlmChildRun(run: RlmChildRun): void {
+		if (run.settled) return;
+		run.settled = true;
+		run.settlement.resolve();
+		this._notifyQuiescenceChange();
+	}
+
+	/**
+	 * Reap host/session resources independently from semantic run settlement.
+	 * A wedged host release is bounded, diagnosed, and force-disposed without
+	 * holding waitForQuiescence() or a terminal child update hostage.
+	 */
+	private _scheduleRlmChildCleanup(
+		childId: string,
+		cleanup: () => Promise<void>,
+		forceDispose: () => void,
+		options: {
+			onSuccess?: () => void | Promise<void>;
+			onFailure?: (error: Error) => void | Promise<void>;
+		} = {},
+	): Promise<void> {
+		const existing = this._rlmChildCleanupOperations.get(childId);
+		if (existing) return existing;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<void>((_resolve, reject) => {
+			timeout = setTimeout(() => {
+				reject(new Error(`RLM child ${childId} cleanup timed out after ${RLM_CHILD_CLEANUP_TIMEOUT_MS}ms`));
+			}, RLM_CHILD_CLEANUP_TIMEOUT_MS);
+			if (typeof timeout === "object" && "unref" in timeout) timeout.unref();
+		});
+		let tracked!: Promise<void>;
+		tracked = Promise.race([Promise.resolve().then(cleanup), deadline])
+			.then(() => options.onSuccess?.())
+			.catch(async (error: unknown) => {
+				const cleanupError = error instanceof Error ? error : new Error(String(error));
+				if (!this._disposed && !this._disposing) {
+					const run = this._activeRlmChildRuns.get(childId);
+					if (run) {
+						run.error = run.error
+							? `${run.error} (cleanup: ${cleanupError.message})`
+							: `Cleanup failed: ${cleanupError.message}`;
+						run.emitUpdate?.();
+					}
+				}
+				try {
+					forceDispose();
+				} catch {
+					// Cleanup remains best-effort even if force-dispose also fails.
+				}
+				await options.onFailure?.(cleanupError);
+			})
+			.finally(() => {
+				if (timeout) clearTimeout(timeout);
+				if (this._rlmChildCleanupOperations.get(childId) === tracked) {
+					this._rlmChildCleanupOperations.delete(childId);
+				}
+			});
+		this._rlmChildCleanupOperations.set(childId, tracked);
+		return tracked;
+	}
+
+	private _scheduleRlmChildTermination(run: RlmChildRun, abortResult: void | Promise<void>): void {
+		if (run.terminationScheduled || (!run.execution && !abortResult)) return;
+		run.terminationScheduled = true;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<void>((_resolve, reject) => {
+			timeout = setTimeout(() => {
+				reject(new Error(`RLM child ${run.id} termination timed out after ${RLM_CHILD_TERMINATION_TIMEOUT_MS}ms`));
+			}, RLM_CHILD_TERMINATION_TIMEOUT_MS);
+			if (typeof timeout === "object" && "unref" in timeout) timeout.unref();
+		});
+		const termination = Promise.allSettled([
+			...(run.execution ? [run.execution] : []),
+			...(abortResult ? [abortResult] : []),
+		]).then(() => undefined);
+		let tracked!: Promise<void>;
+		tracked = Promise.race([termination, deadline])
+			.catch(() => {
+				run.unsubscribe?.();
+				run.session?.dispose();
+			})
+			.finally(() => {
+				if (timeout) clearTimeout(timeout);
+				this._rlmChildTerminationOperations.delete(tracked);
+				this._notifyQuiescenceChange();
+			});
+		this._rlmChildTerminationOperations.add(tracked);
+		this._notifyQuiescenceChange();
+	}
+
+	private _cancelRlmChildRun(
+		run: RlmChildRun,
+		reason: string,
+		options: { preserveTask?: boolean; suppressTerminalNotice?: boolean } = {},
+	): boolean {
+		const { preserveTask = false, suppressTerminalNotice = false } = options;
 		if (run.status !== "running" && run.status !== "queued") {
 			return false;
 		}
 		run.status = "cancelled";
 		run.error = reason;
 		if (!preserveTask && run.taskId && this._taskGraph) {
-			const callerAgentId = this._taskActorId ?? this._taskGraph.rootAgentId;
-			const task = this._taskGraph.getTask(run.taskId);
-			if (task.status !== "completed" && task.status !== "cancelled" && task.status !== "interrupted") {
-				this._taskGraph.cancelTask(run.taskId, callerAgentId, reason);
+			try {
+				const callerAgentId = this._taskActorId ?? this._taskGraph.rootAgentId;
+				const task = this._taskGraph.getTask(run.taskId);
+				if (task.status !== "completed" && task.status !== "cancelled" && task.status !== "interrupted") {
+					this._taskGraph.cancelTask(run.taskId, callerAgentId, reason);
+				}
+			} catch (error) {
+				const taskError = error instanceof Error ? error.message : String(error);
+				run.error = `${reason} (task cancellation: ${taskError})`;
 			}
 		}
 		run.publication.reject(new Error(reason));
-		run.abort();
+		let suppressForDelegatedCompletion = false;
+		try {
+			suppressForDelegatedCompletion = this._hasPendingCoalescedDelegatedCompletionWait();
+		} catch (error) {
+			const taskError = error instanceof Error ? error.message : String(error);
+			run.error = `${run.error ?? reason} (completion wait: ${taskError})`;
+		}
+		if (!suppressTerminalNotice && !run.detachedDeletion && !suppressForDelegatedCompletion) {
+			run.terminalNoticeScheduled = true;
+			this._scheduleRlmChildTerminalNotice(
+				createRlmChildTerminalNoticeMessage({
+					kind: "cancelled",
+					childId: run.id,
+					sessionName: run.sessionName,
+					reason,
+				}),
+				run.session,
+				run.sessionName,
+			);
+		}
+		try {
+			this._scheduleRlmChildTermination(run, run.abort());
+		} catch (error) {
+			const abortError = error instanceof Error ? error.message : String(error);
+			run.error = `${run.error ?? reason} (abort: ${abortError})`;
+			this._scheduleRlmChildTermination(run, undefined);
+		}
+		this._settleRlmChildRun(run);
 		// Surface the cancellation immediately; the run's own terminal update is
 		// delayed indefinitely when the child is stuck mid-stream, which is
 		// exactly when users reach for the kill.
@@ -9772,7 +10000,7 @@ export class AgentSession {
 
 	private async _retireTaskRuntime(taskId: string, reason: string): Promise<void> {
 		for (const run of this._activeRlmChildRuns.values()) {
-			if (run.taskId === taskId) this._cancelRlmChildRun(run, reason, true);
+			if (run.taskId === taskId) this._cancelRlmChildRun(run, reason, { preserveTask: true });
 		}
 		for (const [childId, session] of this._rlmChildSessions) {
 			if (session.taskId !== taskId) continue;
@@ -9802,6 +10030,10 @@ export class AgentSession {
 	}
 
 	private async _awaitPendingRlmChildPublication(selector: string): Promise<string | undefined> {
+		const retained =
+			this._rlmChildSessions.get(selector) ??
+			[...this._rlmChildSessions.values()].find((session) => session.sessionName === selector);
+		if (retained) return retained.sessionId;
 		const run = [...this._activeRlmChildRuns.values()].find(
 			(candidate) =>
 				(candidate.status === "queued" || candidate.status === "running" || candidate.status === "done") &&
@@ -10054,6 +10286,29 @@ export class AgentSession {
 		return session?.disposeAsync() ?? Promise.resolve();
 	}
 
+	private _retainRlmChildCleanupFailure(run: RlmChildRun, session?: AgentSession): void {
+		if (this._disposed || this._disposing) return;
+		const entry: RlmSubagentRegistryEntry = run.detachedDeletion ?? {
+			rlm_child_id: run.id,
+			active_session_id: null,
+			session_id: session?.sessionId ?? null,
+			session_name: session?.sessionName ?? run.sessionName,
+			session_dir: run.sessionDir,
+			status: run.status === "done" ? "completed" : "error",
+			...(run.taskId ? { task_id: run.taskId } : {}),
+		};
+		if (session) {
+			session._quiescenceParent = this;
+			this._rlmChildSessions.set(run.id, session);
+			if (run.unsubscribe) this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
+		}
+		this._rlmChildCleanupFailures.set(run.id, entry);
+		if (this._activeRlmChildRuns.get(run.id) === run) this._activeRlmChildRuns.delete(run.id);
+		run.abort = noopRlmChildAbort;
+		run.unsubscribe = undefined;
+		run.session = undefined;
+	}
+
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
 		run?.unsubscribe?.();
 		this._rlmChildUnsubscribes.get(childId)?.();
@@ -10090,8 +10345,23 @@ export class AgentSession {
 		const childId = subagent.rlm_child_id;
 		const run = this._activeRlmChildRuns.get(childId);
 		if (run) {
-			if (!this._cancelRlmChildRun(run, "Deleted by parent orchestrator")) {
+			if (
+				!this._cancelRlmChildRun(run, "Deleted by parent orchestrator", {
+					suppressTerminalNotice: true,
+				})
+			) {
 				this._emitRlmSubagentRemoval(subagent);
+			}
+			const pendingCleanup = this._rlmChildCleanupOperations.get(childId);
+			if (pendingCleanup) {
+				await pendingCleanup;
+				if (this._rlmChildCleanupFailures.has(childId)) {
+					const retained = this._rlmChildSessions.get(childId);
+					await this._deleteRlmSubagentSession(childId, retained);
+					this._deletedRlmChildIds.add(childId);
+					this._removeRlmSubagentTracking(childId, run);
+					return { subagent };
+				}
 			}
 			const liveSession = run.session;
 			if (run.status === "error" && !liveSession && run.settled) {
@@ -10481,7 +10751,7 @@ export class AgentSession {
 			child._quiescenceParent = this;
 			if (this._activeRlmChildRuns.get(run.id) !== run) return;
 			run.session = child;
-			run.abort = () => void child.abort();
+			run.abort = () => child.abort();
 			run.publication.resolve();
 		};
 		const subagentOptions: CreateRlmSubagentRuntimeOptions = {
@@ -10500,31 +10770,16 @@ export class AgentSession {
 			signal: startupAbortController.signal,
 		};
 
-		const deliverTerminalMessageToParent = async (message: CustomMessage): Promise<void> => {
-			const childController = childSession?._agentMessageController;
-			if (childController) {
-				try {
-					await childController.sendAgentMessage({
-						target: this.sessionId,
-						message: message.content as string,
-					});
-					return;
-				} catch {
-					// An unattributed notice beats silence, so fall through to the injected path.
-				}
-			}
-			await this._promptInjectedMessage(message.content as string, message, {
-				streamingBehavior: "followUp",
-				queueIfBusy: true,
-				returnAfterAccepted: true,
-				suppressAutonomousContinuation: true,
-			}).catch(() => undefined);
+		const admitTerminalMessageToParent = (message: CustomMessage): void => {
+			if (run.terminalNoticeScheduled) return;
+			run.terminalNoticeScheduled = true;
+			this._scheduleRlmChildTerminalNotice(message, childSession, sessionName);
 		};
 
 		// Runtime startup and the task run are deliberately detached. The public
 		// spawn resolves at admission, while this task owns live tracking, usage,
 		// retention, cancellation, and late-startup cleanup.
-		void (async () => {
+		const execution = (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
 			try {
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
@@ -10764,14 +11019,33 @@ export class AgentSession {
 				run.status = "done";
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
-				emitChildUpdate();
+				const retained = this.registerRlmChildSession(run.id, child);
+				if (!retained && !run.detachedDeletion) {
+					const cleanupRuntime = childRuntime;
+					const cleanupHost = this._subagentRuntimeHost;
+					this._scheduleRlmChildCleanup(
+						run.id,
+						async () => {
+							if (cleanupRuntime && cleanupHost?.releaseRlmSubagentRuntime) {
+								await cleanupHost.releaseRlmSubagentRuntime(cleanupRuntime, subagentOptions, "error");
+								return;
+							}
+							await child.disposeAsync();
+						},
+						() => child.dispose(),
+						{
+							onSuccess: () => this._removeRlmSubagentTracking(run.id, run),
+							onFailure: () => this._retainRlmChildCleanupFailure(run, child),
+						},
+					);
+				}
 				if (
 					!run.detachedDeletion &&
 					child._parentReplyCount === parentReplyCountBeforeRun &&
 					!suppressTerminalMessage
 				) {
 					const lastAssistantText = child.getLastAssistantText();
-					await deliverTerminalMessageToParent(
+					admitTerminalMessageToParent(
 						createRlmChildTerminalNoticeMessage({
 							kind: "completed_without_reply",
 							childId: run.id,
@@ -10781,27 +11055,13 @@ export class AgentSession {
 					);
 				}
 				if (delegatedTaskId && this._taskGraph) {
-					await this._drainPendingTaskResumes().catch(() => undefined);
+					void this._drainPendingTaskResumes().catch(() => undefined);
 				}
-				if (!this.registerRlmChildSession(run.id, child)) {
-					if (childRuntime && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
-						await this._subagentRuntimeHost
-							.releaseRlmSubagentRuntime(childRuntime, subagentOptions, "error")
-							.catch(() => void child.disposeAsync().catch(() => undefined));
-					} else {
-						await child.disposeAsync().catch(() => undefined);
-					}
-				}
+				this._settleRlmChildRun(run);
+				emitChildUpdate();
 			} catch (error) {
 				const runError = error instanceof Error ? error : new Error(String(error));
 				run.failure = runError;
-				let suppressTerminalMessage = false;
-				if (delegatedTaskId && this._taskGraph) {
-					if (this._taskGraph.getTask(delegatedTaskId).ownerAgentId === childNodeId) {
-						this._taskGraph.interruptTask(delegatedTaskId, childNodeId, runError.message);
-					}
-					suppressTerminalMessage = this._hasPendingCoalescedDelegatedCompletionWait();
-				}
 				run.publication.reject(runError);
 				if (run.status !== "cancelled") {
 					run.status = "error";
@@ -10809,10 +11069,55 @@ export class AgentSession {
 				}
 				durationMs = Date.now() - startedAt;
 				activity = undefined;
-				emitChildUpdate();
+				let suppressTerminalMessage = false;
+				if (delegatedTaskId && this._taskGraph) {
+					try {
+						if (this._taskGraph.getTask(delegatedTaskId).ownerAgentId === childNodeId) {
+							this._taskGraph.interruptTask(delegatedTaskId, childNodeId, runError.message);
+						}
+						suppressTerminalMessage = this._hasPendingCoalescedDelegatedCompletionWait();
+					} catch (taskError) {
+						const taskErrorMessage = taskError instanceof Error ? taskError.message : String(taskError);
+						run.error = `${run.error ?? runError.message} (task interruption: ${taskErrorMessage})`;
+					}
+				}
+				if (!run.detachedDeletion) {
+					const cleanupSession = childRuntime?.session ?? childSession;
+					if (cleanupSession) {
+						const cleanupRuntime = childRuntime ?? { session: cleanupSession };
+						const cleanupHost = this._subagentRuntimeHost;
+						const cleanupStatus = run.status === "cancelled" ? "cancelled" : "error";
+						this._scheduleRlmChildCleanup(
+							run.id,
+							async () => {
+								if (cleanupHost?.releaseRlmSubagentRuntime) {
+									await cleanupHost.releaseRlmSubagentRuntime(cleanupRuntime, subagentOptions, cleanupStatus);
+								} else if (childRuntime && cleanupHost) {
+									await cleanupHost.deleteRlmSubagentRuntime(run.id, childRuntime.session);
+								} else {
+									await cleanupSession.disposeAsync();
+								}
+							},
+							() => cleanupSession.dispose(),
+							{
+								onSuccess: () => {
+									if (cleanupStatus === "cancelled") {
+										if (!this._disposed && !this._disposing) this._deletedRlmChildIds.add(run.id);
+										this._removeRlmSubagentTracking(run.id, run);
+										return;
+									}
+									run.unsubscribe?.();
+									run.abort = noopRlmChildAbort;
+									run.unsubscribe = undefined;
+								},
+								onFailure: () => this._retainRlmChildCleanupFailure(run, cleanupSession),
+							},
+						);
+					}
+				}
 				if (!run.detachedDeletion && !suppressTerminalMessage) {
 					if (run.status === "error") {
-						await deliverTerminalMessageToParent(
+						admitTerminalMessageToParent(
 							createRlmChildFailureMessage({
 								childId: run.id,
 								sessionName,
@@ -10820,7 +11125,7 @@ export class AgentSession {
 							}),
 						);
 					} else if (run.status === "cancelled") {
-						await deliverTerminalMessageToParent(
+						admitTerminalMessageToParent(
 							createRlmChildTerminalNoticeMessage({
 								kind: "cancelled",
 								childId: run.id,
@@ -10831,50 +11136,38 @@ export class AgentSession {
 					}
 				}
 				if (delegatedTaskId && this._taskGraph) {
-					await this._drainPendingTaskResumes().catch(() => undefined);
+					void this._drainPendingTaskResumes().catch(() => undefined);
 				}
-				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
-					try {
-						await this._subagentRuntimeHost.releaseRlmSubagentRuntime(
-							childRuntime ?? { session: childSession },
-							subagentOptions,
-							run.status === "cancelled" ? "cancelled" : "error",
-						);
-						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
-							this._deletedRlmChildIds.add(run.id);
-							this._removeRlmSubagentTracking(run.id);
-						}
-					} catch {
-						await childSession?.disposeAsync().catch(() => undefined);
-					}
-				} else if (!run.detachedDeletion) {
-					try {
-						if (childRuntime && this._subagentRuntimeHost) {
-							await this._subagentRuntimeHost.deleteRlmSubagentRuntime(run.id, childRuntime.session);
-						} else if (childSession) {
-							await childSession.disposeAsync();
-						}
-						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
-							this._deletedRlmChildIds.add(run.id);
-							this._removeRlmSubagentTracking(run.id);
-						}
-					} catch {
-						// A failed best-effort retry remains available through the retained cleanup maps.
-					}
+				if (!run.detachedDeletion) this._settleRlmChildRun(run);
+				emitChildUpdate();
+				if (
+					!run.detachedDeletion &&
+					run.status === "cancelled" &&
+					!childRuntime &&
+					!childSession &&
+					!this._disposed &&
+					!this._disposing
+				) {
+					this._deletedRlmChildIds.add(run.id);
+					this._removeRlmSubagentTracking(run.id, run);
 				}
 			} finally {
 				if (run.detachedDeletion && childRuntime) {
-					try {
-						await this._deleteRlmSubagentSession(run.id, childRuntime.session);
-					} catch {
-						if (!this._disposed && !this._disposing) {
-							this._rlmChildSessions.set(run.id, childRuntime.session);
-							this._rlmChildCleanupFailures.set(run.id, run.detachedDeletion);
-						}
-					}
+					const cleanupSession = childRuntime.session;
+					this._scheduleRlmChildCleanup(
+						run.id,
+						() => this._deleteRlmSubagentSession(run.id, cleanupSession),
+						() => cleanupSession.dispose(),
+						{
+							onSuccess: () => this._removeRlmSubagentTracking(run.id, run),
+							onFailure: () => this._retainRlmChildCleanupFailure(run, cleanupSession),
+						},
+					);
 				}
 				if (this._activeRlmChildRuns.get(run.id) === run) {
-					if (this._rlmChildSessions.has(run.id)) {
+					if (this._rlmChildCleanupOperations.has(run.id)) {
+						// The keyed reaper owns final tracking and name-reservation transfer.
+					} else if (this._rlmChildSessions.has(run.id)) {
 						this._activeRlmChildRuns.delete(run.id);
 						if (run.unsubscribe) this._rlmChildUnsubscribes.set(run.id, run.unsubscribe);
 						run.abort = noopRlmChildAbort;
@@ -10888,11 +11181,11 @@ export class AgentSession {
 						run.unsubscribe = undefined;
 					}
 				}
-				run.settled = true;
-				run.settlement.resolve();
-				this._notifyQuiescenceChange();
+				this._settleRlmChildRun(run);
 			}
-		})().catch(() => undefined);
+		})();
+		run.execution = execution;
+		void execution.catch(() => undefined);
 
 		return {
 			rlm_child_id: childNodeId,

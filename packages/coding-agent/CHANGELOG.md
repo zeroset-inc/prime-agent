@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed failed or cancelled recursive child runs causing headless sessions to hang indefinitely.
+
 ## [0.7.12] - 2026-08-19
 
 - Added durable graph-scoped delegated-task convergence with an absolute exploration ceiling that survives task reassignment and recovery.

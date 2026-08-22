@@ -1,10 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
-import {
-	AGENT_MESSAGE_CUSTOM_TYPE,
-	type AgentSessionMessage,
-	createAgentSessionMessage,
-} from "../../../src/core/agent-messages.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AGENT_MESSAGE_CUSTOM_TYPE, type AgentSessionMessage } from "../../../src/core/agent-messages.js";
 import { createHarness, type Harness } from "../harness.js";
 
 function terminalMessage(messages: readonly unknown[]): AgentSessionMessage | undefined {
@@ -32,35 +28,11 @@ describe("#617 subagent terminal agent messages", () => {
 
 	it("delivers a child completion without a reply as an attributed agent message", async () => {
 		const childSessionName = "terminal-worker";
+		const sendAgentMessage = vi.fn(() => new Promise<never>(() => {}));
 		child = await createHarness({
 			agentMessageController: {
 				listAgents: () => ({ agents: [] }),
-				sendAgentMessage: async (input) => {
-					expect(input).toMatchObject({
-						target: parent!.session.sessionId,
-						message: expect.stringContaining("completed without sending a reply"),
-					});
-					const message = createAgentSessionMessage({
-						id: "agentmsg-terminal-completion",
-						source: "agent_message",
-						message: input.message,
-						from: {
-							activeSessionId: "child-active",
-							sessionId: child!.session.sessionId,
-							sessionName: childSessionName,
-						},
-						fromRelationship: "child",
-						target: { activeSessionId: "parent-active", sessionId: parent!.session.sessionId },
-					});
-					await parent!.session.acceptAgentMessagePrompt(message.content, { customMessage: message });
-					return {
-						id: message.details.id,
-						source: "agent_message",
-						target: { activeSessionId: "parent-active", sessionId: parent!.session.sessionId },
-						message: input.message,
-						deliveryStatus: "delivered",
-					};
-				},
+				sendAgentMessage,
 			},
 		});
 		parent = await createHarness({
@@ -80,7 +52,7 @@ describe("#617 subagent terminal agent messages", () => {
 			.toMatchObject({
 				customType: AGENT_MESSAGE_CUSTOM_TYPE,
 				details: {
-					id: "agentmsg-terminal-completion",
+					id: expect.stringMatching(/^agentmsg_/),
 					fromRelationship: "child",
 					from: { sessionId: child.session.sessionId, sessionName: childSessionName },
 				},
@@ -90,16 +62,16 @@ describe("#617 subagent terminal agent messages", () => {
 			expect.objectContaining({ customType: "rlm_child_terminal_notice" }),
 		);
 		expect(terminalMessage(parent.session.messages)?.content).toContain(spawned.rlm_child_id);
+		expect(sendAgentMessage).not.toHaveBeenCalled();
 	});
-	it("falls back to an injected notice when the agent message cannot be delivered", async () => {
-		// A controller that always rejects: the parent must still learn the child
-		// finished. Losing the notice entirely is worse than losing attribution.
+	it("does not depend on child message transport for attributed delivery", async () => {
+		const sendAgentMessage = vi.fn(async () => {
+			throw new Error("delivery unavailable");
+		});
 		child = await createHarness({
 			agentMessageController: {
 				listAgents: () => ({ agents: [] }),
-				sendAgentMessage: async () => {
-					throw new Error("delivery unavailable");
-				},
+				sendAgentMessage,
 			},
 		});
 		parent = await createHarness({
@@ -114,12 +86,7 @@ describe("#617 subagent terminal agent messages", () => {
 		await parent.session.runRlmChild("do the work");
 		await new Promise((resolve) => setTimeout(resolve, 200));
 
-		// The notice arrives some way: either the agent message or the injected
-		// fallback, but never silently dropped.
-		const sawNotice = parent.session.messages.some((message) => {
-			const content = (message as { content?: unknown }).content;
-			return typeof content === "string" && content.includes("completed without sending a reply");
-		});
-		expect(sawNotice || terminalMessage(parent.session.messages) !== undefined).toBe(true);
+		expect(terminalMessage(parent.session.messages)?.content).toContain("completed without sending a reply");
+		expect(sendAgentMessage).not.toHaveBeenCalled();
 	}, 60_000);
 });
