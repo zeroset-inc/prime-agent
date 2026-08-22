@@ -383,7 +383,7 @@ jobs:
           }
           trap cleanup_smoke_dir EXIT
           npm install --prefix "$smoke_dir" --ignore-scripts --no-audit --no-fund "$INSTALL_URL"
-          installed_version=$("$smoke_dir/node_modules/.bin/prime-agent" --version)
+          installed_version=$("$smoke_dir/node_modules/.bin/prime-agent" --version 2>&1)
           test "$installed_version" = "$BETA_VERSION"
 
       - name: Advance beta release
