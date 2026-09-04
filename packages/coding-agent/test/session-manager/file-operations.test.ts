@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { computeOwnAndTotalUsage } from "../../src/core/context-tree.js";
 import {
 	findMostRecentSession,
 	loadEntriesFromFile,
@@ -10,6 +11,7 @@ import {
 	resolveSessionRlmDepth,
 	SessionManager,
 } from "../../src/core/session-manager.js";
+import { sessionUsageSummaryFrom } from "../../src/core/usage.js";
 
 describe("loadEntriesFromFile", () => {
 	let tempDir: string;
@@ -497,7 +499,6 @@ describe("findMostRecentSession", () => {
 		const file2 = join(tempDir, "newer.jsonl");
 
 		writeFileSync(file1, '{"type":"session","id":"old","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
-		// Small delay to ensure different mtime
 		await new Promise((r) => setTimeout(r, 10));
 		writeFileSync(file2, '{"type":"session","id":"new","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n');
 
@@ -534,12 +535,10 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 
 		const sm = SessionManager.open(emptyFile, tempDir);
 
-		// Should have created a new session with valid header
 		expect(sm.getSessionId()).toBeTruthy();
 		expect(sm.getHeader()).toBeTruthy();
 		expect(sm.getHeader()?.type).toBe("session");
 
-		// File should now contain a valid header
 		const content = readFileSync(emptyFile, "utf-8");
 		const lines = content.trim().split("\n").filter(Boolean);
 		expect(lines.length).toBe(1);
@@ -550,7 +549,6 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 
 	it("truncates and rewrites file without valid header", () => {
 		const noHeaderFile = join(tempDir, "no-header.jsonl");
-		// File with messages but no session header (corrupted state)
 		writeFileSync(
 			noHeaderFile,
 			'{"type":"message","id":"abc","parentId":"orphaned","timestamp":"2025-01-01T00:00:00Z","message":{"role":"assistant","content":"test"}}\n',
@@ -558,12 +556,10 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 
 		const sm = SessionManager.open(noHeaderFile, tempDir);
 
-		// Should have created a new session with valid header
 		expect(sm.getSessionId()).toBeTruthy();
 		expect(sm.getHeader()).toBeTruthy();
 		expect(sm.getHeader()?.type).toBe("session");
 
-		// File should now contain only a valid header (old content truncated)
 		const content = readFileSync(noHeaderFile, "utf-8");
 		const lines = content.trim().split("\n").filter(Boolean);
 		expect(lines.length).toBe(1);
@@ -578,7 +574,6 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 
 		const sm = SessionManager.open(explicitPath, tempDir);
 
-		// The session file path should be preserved
 		expect(sm.getSessionFile()).toBe(explicitPath);
 	});
 
@@ -586,13 +581,74 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		const corruptedFile = join(tempDir, "corrupted.jsonl");
 		writeFileSync(corruptedFile, "garbage content\n");
 
-		// First open recovers the file
 		const sm1 = SessionManager.open(corruptedFile, tempDir);
 		const sessionId = sm1.getSessionId();
 
-		// Second open should load the recovered file successfully
 		const sm2 = SessionManager.open(corruptedFile, tempDir);
 		expect(sm2.getSessionId()).toBe(sessionId);
 		expect(sm2.getHeader()?.type).toBe("session");
+	});
+});
+
+describe("session info usage totals", () => {
+	it("scan and resident computation agree on whole-file own spend, forks and attributions included", async () => {
+		const tempDir = join(tmpdir(), `session-usage-test-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+		try {
+			const usage = (input: number, output: number, cost: number, cacheRead = 10, cacheWrite = 5) => ({
+				input,
+				output,
+				cacheRead,
+				cacheWrite,
+				totalTokens: input + output,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+			});
+			const msg = (id: string, parentId: string | null, role: string, u?: unknown) =>
+				({ type: "message", id, parentId, message: { role, content: "x", timestamp: 1, usage: u } }) as const;
+			const file = join(tempDir, "usage.jsonl");
+			const lines = [
+				{ type: "session", version: 3, id: "s1", timestamp: "2026-01-01T00:00:00Z", cwd: "/tmp" },
+				msg("m1", null, "user"),
+				msg("m2", "m1", "assistant", usage(1000, 200, 0.5)),
+				// On-disk original usage; the loader folds the aggregate below onto it in memory.
+				msg("m3", "m1", "assistant", usage(2000, 300, 1.0)),
+				{
+					type: "child_usage_attributed",
+					id: "a1",
+					parentId: "m3",
+					targetId: "m3",
+					childUsage: usage(500, 100, 0.4),
+					aggregateUsage: usage(2500, 400, 1.4, 20, 10),
+				},
+				{
+					type: "compaction",
+					id: "c1",
+					parentId: "m3",
+					summary: "compacted",
+					firstKeptEntryId: "m3",
+					tokensBefore: 5000,
+					usage: usage(100, 20, 0.05),
+				},
+				{
+					type: "branch_summary",
+					id: "b1",
+					parentId: "c1",
+					fromId: "m1",
+					summary: "left",
+					usage: usage(60, 8, 0.02),
+				},
+			];
+			writeFileSync(file, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+
+			const entries = SessionManager.open(file).getEntries();
+			const resident = sessionUsageSummaryFrom(computeOwnAndTotalUsage(entries, entries).ownUsage);
+
+			const scanned = (await readSessionInfo(file))?.usage;
+			expect(scanned).toMatchObject({ inputTokens: 3220, outputTokens: 528 });
+			expect(scanned?.cost).toBeCloseTo(1.57);
+			expect(resident).toEqual(scanned);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 });

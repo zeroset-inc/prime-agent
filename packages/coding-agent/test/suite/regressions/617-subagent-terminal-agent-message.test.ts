@@ -1,17 +1,18 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AGENT_MESSAGE_CUSTOM_TYPE, type AgentSessionMessage } from "../../../src/core/agent-messages.js";
-import { createHarness, type Harness } from "../harness.js";
+import type { CustomMessage } from "../../../src/core/messages.js";
+import { waitForHeadlessCompletion } from "../../../src/modes/headless-completion.js";
+import { createHarness, getAssistantTexts, type Harness } from "../harness.js";
 
-function terminalMessage(messages: readonly unknown[]): AgentSessionMessage | undefined {
-	return messages.find(
-		(message): message is AgentSessionMessage =>
+function terminalNotices(messages: readonly unknown[]): CustomMessage[] {
+	return messages.filter(
+		(message): message is CustomMessage =>
 			typeof message === "object" &&
 			message !== null &&
 			"role" in message &&
 			"customType" in message &&
 			(message as { role?: unknown }).role === "custom" &&
-			(message as { customType?: unknown }).customType === AGENT_MESSAGE_CUSTOM_TYPE,
+			(message as { customType?: unknown }).customType === "rlm_child_terminal_notice",
 	);
 }
 
@@ -26,9 +27,11 @@ describe("#617 subagent terminal agent messages", () => {
 		parent = undefined;
 	});
 
-	it("delivers a child completion without a reply as an attributed agent message", async () => {
+	it("delivers a child completion without a reply through the private typed notice path", async () => {
 		const childSessionName = "terminal-worker";
-		const sendAgentMessage = vi.fn(() => new Promise<never>(() => {}));
+		const sendAgentMessage = vi.fn(async () => {
+			throw new Error("synthesized terminal notices must not use agent_message");
+		});
 		child = await createHarness({
 			agentMessageController: {
 				listAgents: () => ({ agents: [] }),
@@ -47,26 +50,25 @@ describe("#617 subagent terminal agent messages", () => {
 
 		const spawned = await parent.session.runRlmChild("finish without replying", { name: childSessionName });
 
-		await expect
-			.poll(() => terminalMessage(parent!.session.messages))
-			.toMatchObject({
-				customType: AGENT_MESSAGE_CUSTOM_TYPE,
-				details: {
-					id: expect.stringMatching(/^agentmsg_/),
-					fromRelationship: "child",
-					from: { sessionId: child.session.sessionId, sessionName: childSessionName },
-				},
-				content: expect.stringContaining(`[from child:${childSessionName}]`),
-			});
-		expect(parent.session.messages).not.toContainEqual(
-			expect.objectContaining({ customType: "rlm_child_terminal_notice" }),
-		);
-		expect(terminalMessage(parent.session.messages)?.content).toContain(spawned.rlm_child_id);
+		await expect.poll(() => terminalNotices(parent!.session.messages)).toHaveLength(1);
 		expect(sendAgentMessage).not.toHaveBeenCalled();
+		expect(terminalNotices(parent.session.messages)[0]).toMatchObject({
+			customType: "rlm_child_terminal_notice",
+			details: {
+				kind: "completed_without_reply",
+				childId: spawned.rlm_child_id,
+				sessionName: childSessionName,
+			},
+			content: expect.stringContaining(
+				`RLM child ${childSessionName} (${spawned.rlm_child_id}) completed without sending a reply`,
+			),
+		});
 	});
-	it("does not depend on child message transport for attributed delivery", async () => {
+
+	it("waits for the parent to consume a child terminal notice", async () => {
+		const childSessionName = "headless-worker";
 		const sendAgentMessage = vi.fn(async () => {
-			throw new Error("delivery unavailable");
+			throw new Error("synthesized terminal notices must not use agent_message");
 		});
 		child = await createHarness({
 			agentMessageController: {
@@ -75,18 +77,31 @@ describe("#617 subagent terminal agent messages", () => {
 			},
 		});
 		parent = await createHarness({
+			serializedRefine: true,
+			rlmDepth: 0,
+			rlmMaxDepth: 1,
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child!.session }),
 				deleteRlmSubagentRuntime: async () => {},
-			} as never,
+			},
 		});
-		child.setResponses([fauxAssistantMessage("done, no reply to parent")]);
-		parent.setResponses([fauxAssistantMessage("parent ack")]);
+		child.setResponses([fauxAssistantMessage("child completed")]);
+		parent.setResponses([fauxAssistantMessage("parent consumed the child result")]);
 
-		await parent.session.runRlmChild("do the work");
-		await new Promise((resolve) => setTimeout(resolve, 200));
+		const spawned = await parent.session.runRlmChild("finish without replying", { name: childSessionName });
+		await waitForHeadlessCompletion(parent.session, { waitForRlmQuiescence: true });
 
-		expect(terminalMessage(parent.session.messages)?.content).toContain("completed without sending a reply");
 		expect(sendAgentMessage).not.toHaveBeenCalled();
-	}, 60_000);
+		expect(terminalNotices(parent.session.messages)).toEqual([
+			expect.objectContaining({
+				details: expect.objectContaining({
+					kind: "completed_without_reply",
+					childId: spawned.rlm_child_id,
+					sessionName: childSessionName,
+				}),
+			}),
+		]);
+		expect(getAssistantTexts(parent)).toEqual(["parent consumed the child result"]);
+		expect(parent.session.hasRunningRlmChildren()).toBe(false);
+	});
 });

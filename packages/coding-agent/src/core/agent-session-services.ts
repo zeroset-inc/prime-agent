@@ -14,32 +14,19 @@ import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
-import type { SubagentRuntimeHost } from "./rlm-runtime.js";
+import type { RlmSubagentCapacityPool, SubagentRuntimeHost } from "./rlm-runtime.js";
 import { type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
+import { semanticEdgeLedgerPath } from "./semantic-edges.js";
 import type { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import type { AgentTaskGraph } from "./task-graph.js";
 import { installAgentTelemetry, isTelemetryEnabled } from "./telemetry.js";
 
-/**
- * Non-fatal issues collected while creating services or sessions.
- *
- * Runtime creation returns diagnostics to the caller instead of printing or
- * exiting. The app layer decides whether warnings should be shown and whether
- * errors should abort startup.
- */
 export interface AgentSessionRuntimeDiagnostic {
 	type: "info" | "warning" | "error";
 	message: string;
 }
 
-/**
- * Inputs for creating cwd-bound runtime services.
- *
- * These services are recreated whenever the effective session cwd changes.
- * CLI-provided resource paths should be resolved to absolute paths before they
- * reach this function, so later cwd switches do not reinterpret them.
- */
 export interface CreateAgentSessionServicesOptions {
 	cwd: string;
 	agentDir?: string;
@@ -55,14 +42,12 @@ export interface CreateAgentSessionServicesOptions {
 	 * would release the pane while the parent is still running.
 	 */
 	noBuiltinHerdrReporter?: boolean;
-	/** Explicit daemon-carried opt-out; cannot enable telemetry. */
 	telemetryDisabled?: true;
 }
 
 export interface AgentSessionCreationOptions {
 	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
-	/** Provider service tier. Fast mode uses "priority". */
 	serviceTier?: ServiceTier;
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	tools?: string[];
@@ -79,44 +64,34 @@ export interface AgentSessionCreationOptions {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	rlmParentAgent?: string;
+	semanticParentSessionId?: string;
+	semanticSpawnedByRequestId?: string;
 	/** Shared durable task graph for this run. */
 	taskGraph?: AgentTaskGraph;
 	/** Task owned by this session inside taskGraph. */
 	taskId?: string;
 	/** Task charged for model usage when this session does not own a task. */
 	taskAccountingTaskId?: string;
+	/** Immutable actor identity authorized for task mutations in this session. */
+	taskActorId?: string;
+	/** Shared capacity acquired for every child turn, including retained follow-ups. */
+	turnCapacityPool?: RlmSubagentCapacityPool;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
 	prewarmIpythonKernel?: boolean;
 	autonomous?: AgentAutonomousConfig;
-	/** Serialized refine mode for print/headless autonomous runs. */
 	serializedRefine?: boolean;
-	/** User-facing client mode that created the top-level session. */
 	executionMode?: AgentExecutionMode;
-	/** Explicit daemon-carried opt-out; cannot enable telemetry. */
 	telemetryDisabled?: true;
-	/** Initial goal to seed at session creation (rlmDepth 0 only, idempotent). */
 	initialGoal?: { objective: string; tokenBudget?: number };
 }
 
-/**
- * Inputs for creating an AgentSession from already-created services.
- *
- * Use this after services exist and any cwd-bound model/tool/session options
- * have been resolved against those services.
- */
 export interface CreateAgentSessionFromServicesOptions extends AgentSessionCreationOptions {
 	services: AgentSessionServices;
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
 }
 
-/**
- * Coherent cwd-bound runtime services for one effective session cwd.
- *
- * This is infrastructure only. The AgentSession itself is created separately so
- * session options can be resolved against these services first.
- */
 export interface AgentSessionServices {
 	cwd: string;
 	agentDir: string;
@@ -176,11 +151,6 @@ function applyExtensionFlagValues(
 	return diagnostics;
 }
 
-/**
- * Create cwd-bound runtime services.
- *
- * Returns services plus diagnostics. It does not create an AgentSession.
- */
 export async function createAgentSessionServices(
 	options: CreateAgentSessionServicesOptions,
 ): Promise<AgentSessionServices> {
@@ -194,7 +164,7 @@ export async function createAgentSessionServices(
 	// integration skills by whether the user is logged in (enable-by-login).
 	const mcpManager = new McpManager({
 		authStorage,
-		getUserServers: () => settingsManager.getMcpServers(),
+		getUserServers: () => settingsManager.getGlobalMcpServers(),
 	});
 	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
 	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
@@ -261,19 +231,16 @@ export async function createAgentSessionServices(
 	};
 }
 
-/**
- * Create an AgentSession from previously created services.
- *
- * This keeps session creation separate from service creation so callers can
- * resolve model, thinking, tools, and other session inputs against the target
- * cwd before constructing the session.
- */
 export async function createAgentSessionFromServices(
 	options: CreateAgentSessionFromServicesOptions,
 ): Promise<CreateAgentSessionResult> {
 	installAgentTraceUpload(options.sessionManager, {
 		authStorage: options.services.authStorage,
 		settingsManager: options.services.settingsManager,
+		semanticEdgesLedgerPath: semanticEdgeLedgerPath({
+			rlmSessionDir: options.rlmSessionDir,
+			sessionArtifactDir: options.sessionManager.getSessionArtifactDir(),
+		}),
 	});
 	const result = await createAgentSession({
 		cwd: options.services.cwd,
@@ -302,9 +269,13 @@ export async function createAgentSessionFromServices(
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
 		rlmParentAgent: options.rlmParentAgent,
+		semanticParentSessionId: options.semanticParentSessionId,
+		semanticSpawnedByRequestId: options.semanticSpawnedByRequestId,
 		taskGraph: options.taskGraph,
 		taskId: options.taskId,
 		taskAccountingTaskId: options.taskAccountingTaskId,
+		taskActorId: options.taskActorId,
+		turnCapacityPool: options.turnCapacityPool,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		rlmHeartbeatController: options.rlmHeartbeatController,
 		sessionStartEvent: options.sessionStartEvent,

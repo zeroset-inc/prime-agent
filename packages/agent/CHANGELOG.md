@@ -1,26 +1,14 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.0] - 2026-08-21
 
-## [0.7.12] - 2026-08-19
+- Added `AgentContinueError` with stable codes (`busy`, `nothing-to-continue`) for `Agent.continue()` precondition failures, so callers classify without matching message text.
 
-## [0.7.11] - 2026-08-18
+## [0.7.4] - 2026-08-19
 
-## [0.7.10] - 2026-08-18
+## [0.7.3] - 2026-08-17
 
-## [0.7.9] - 2026-08-18
-
-## [0.7.8] - 2026-08-17
-
-## [0.7.7] - 2026-08-17
-
-## [0.7.6] - 2026-08-17
-
-## [0.7.5] - 2026-08-17
-
-## [0.7.4] - 2026-08-16
-
-## [0.7.3] - 2026-08-15
+- Changed explicit `off` reasoning selections to reach providers instead of being omitted, preserving provider-specific disable behavior.
 
 ## [0.7.2] - 2026-08-11
 

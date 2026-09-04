@@ -19,7 +19,7 @@ export type ContextWindowResolver = (provider: string, modelId: string) => numbe
  * descendants and completed children without an attribution target.
  */
 export interface ContextTreeNode {
-	/** "root" for the session itself, the RLM child node id (sub-xxxx) otherwise. */
+	/** "root" for the session itself; sub-xxxx for an RLM child. */
 	id: string;
 	label: string;
 	status: "active" | RlmChildAgentStatus;
@@ -56,7 +56,6 @@ function readUserMessageText(content: unknown): string {
 		.join("\n");
 }
 
-/** Compact a prompt into a one-line label, mirroring compactRlmText in agent-session.ts. */
 function compactLabel(text: string, maxLength = 80): string {
 	const compact = text.replace(/\s+/g, " ").trim();
 	if (compact.length <= maxLength) {
@@ -93,6 +92,8 @@ export function computeOwnAndTotalUsage(
 		if (isAssistantEntry(entry)) {
 			branchAssistantIds.add(entry.id);
 			addAssistantUsage(totalUsage, entry.message.usage);
+		} else if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage) {
+			addAssistantUsage(totalUsage, entry.usage);
 		}
 	}
 	const ownUsage = cloneUsage(totalUsage);

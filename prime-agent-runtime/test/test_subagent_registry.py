@@ -191,6 +191,41 @@ class RlmSubagentRegistryTest(unittest.TestCase):
             ),
         )
 
+    def test_records_task_plan_and_reusable_handoff(self) -> None:
+        host_request = AsyncMock(side_effect=[{"task": {"id": "task-a"}}, {"task": {"id": "task-a"}}])
+        handoff = {
+            "summary": "One caller remains",
+            "evidenceIds": ["evidence-1"],
+            "recommendedNextScopes": ["Inspect the caller"],
+        }
+
+        with patch.object(rlm_module, "host_request", host_request):
+            asyncio.run(
+                rlm_module.rlm.task.plan(
+                    "coordinator",
+                    "Two independent boundaries",
+                    boundaries=["payload", "caller"],
+                    expected_evidence=["pinned diff"],
+                )
+            )
+            asyncio.run(rlm_module.rlm.task.handoff(handoff))
+
+        self.assertEqual(
+            host_request.await_args_list[0].args,
+            (
+                "rlm.task.plan",
+                {
+                    "plan": {
+                        "mode": "coordinator",
+                        "rationale": "Two independent boundaries",
+                        "boundaries": ["payload", "caller"],
+                        "expectedEvidence": ["pinned diff"],
+                    }
+                },
+            ),
+        )
+        self.assertEqual(host_request.await_args_list[1].args, ("rlm.task.handoff", {"handoff": handoff}))
+
     def test_fetches_full_root_context_on_demand(self) -> None:
         host_request = AsyncMock(return_value={"rootContext": {"manifest": ["a.ts"]}})
 

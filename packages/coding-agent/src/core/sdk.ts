@@ -84,8 +84,6 @@ export interface CreateAgentSessionResult {
 	modelFallbackMessage?: string;
 }
 
-// Re-exports
-
 export type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
 export * from "./agent-session-runtime.js";
 export type { AgentSessionCreationOptions } from "./agent-session-services.js";
@@ -122,15 +120,7 @@ export type { Skill } from "./skills.js";
 export * from "./task-graph.js";
 export type { Tool } from "./tools/index.js";
 
-export {
-	createBashTool,
-	createEditTool,
-	// Tool factories (for custom cwd)
-	createIpythonTool,
-	withFileMutationQueue,
-};
-
-// Helper Functions
+export { createBashTool, createEditTool, createIpythonTool, withFileMutationQueue };
 
 function getDefaultAgentDir(): string {
 	return getAgentDir();
@@ -176,7 +166,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
 
-	// Use provided or create AuthStorage and ModelRegistry
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
 	const authStorage = options.authStorage ?? AuthStorage.create(authPath);
@@ -188,7 +177,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Ensure MCP providers are registered and built-in MCP skills are gated by
 	// auth even on the bare SDK path (not just the CLI's createAgentSessionServices).
 	const mcpManager =
-		options.mcpManager ?? new McpManager({ authStorage, getUserServers: () => settingsManager.getMcpServers() });
+		options.mcpManager ??
+		new McpManager({ authStorage, getUserServers: () => settingsManager.getGlobalMcpServers() });
 	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
 
 	if (!resourceLoader) {
@@ -202,7 +192,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		time("resourceLoader.reload");
 	}
 
-	// Check if session has existing data to restore
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
@@ -211,7 +200,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
 
-	// If session has data, try to restore model from it
 	if (!model && hasExistingSession && existingSession.model) {
 		const restoredModel = modelRegistry.find(existingSession.model.provider, existingSession.model.modelId);
 		if (restoredModel && modelRegistry.hasConfiguredAuth(restoredModel)) {
@@ -222,7 +210,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 	}
 
-	// If still no model, use findInitialModel (checks settings default, then provider defaults)
 	if (!model) {
 		const result = await findInitialModel({
 			scopedModels: [],
@@ -242,19 +229,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let thinkingLevel = options.thinkingLevel;
 
-	// If session has data, restore thinking level from it
 	if (thinkingLevel === undefined && hasExistingSession) {
 		thinkingLevel = hasThinkingEntry
 			? (existingSession.thinkingLevel as ThinkingLevel)
 			: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
 	}
 
-	// Fall back to settings default
 	if (thinkingLevel === undefined) {
 		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
 	}
 
-	// Clamp to model capabilities
 	if (!model) {
 		thinkingLevel = "off";
 	} else {
@@ -274,14 +258,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let agent: Agent;
 
-	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
 		const converted = convertToLlm(messages);
-		// Check setting dynamically so mid-session changes take effect
 		if (!settingsManager.getBlockImages()) {
 			return converted;
 		}
-		// Filter out ImageContent from all messages, replacing with text placeholder
 		return converted.map((msg) => {
 			if (msg.role === "user" || msg.role === "toolResult") {
 				const content = msg.content;
@@ -294,7 +275,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							)
 							.filter(
 								(c, i, arr) =>
-									// Dedupe consecutive "Image reading is disabled." texts
 									!(
 										c.type === "text" &&
 										c.text === "Image reading is disabled." &&
@@ -368,14 +348,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
 
-	// Restore messages if session has existing data
 	if (hasExistingSession) {
 		agent.state.messages = existingSession.messages;
 		if (!hasThinkingEntry) {
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
 	} else {
-		// Save initial configuration for new sessions so it can be restored on resume.
 		if (model) {
 			sessionManager.appendModelChange(model.provider, model.id);
 		}
@@ -411,8 +389,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
 		rlmParentAgent: options.rlmParentAgent,
+		semanticParentSessionId: options.semanticParentSessionId,
+		semanticSpawnedByRequestId: options.semanticSpawnedByRequestId,
 		taskGraph: options.taskGraph,
 		taskId: options.taskId,
+		taskAccountingTaskId: options.taskAccountingTaskId,
+		taskActorId: options.taskActorId,
+		turnCapacityPool: options.turnCapacityPool,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,

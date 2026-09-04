@@ -965,16 +965,17 @@ describe("AgentTaskGraph", () => {
 			},
 		});
 		graph.startTask(child.id, "old-agent");
-		graph.updateProgress(child.id, "old-agent", {
-			summary: "First evidence",
-			evidenceRefs: ["artifact://first"],
+		const trusted = graph.recordEvidence(child.id, "old-agent", {
+			kind: "repository-read",
+			subjects: ["a.ts"],
+			contentDigest: "1".repeat(64),
 		});
 		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "old-agent", 1)).toMatchObject({
 			state: {
 				phase: "exploring",
 				explorationToolCalls: 1,
 				toolCallsWithoutEvidence: 1,
-				seenEvidenceRefs: ["artifact://first"],
+				seenEvidenceRefs: [trusted.evidence.id],
 			},
 			enteredFinalizing: false,
 		});
@@ -1008,7 +1009,7 @@ describe("AgentTaskGraph", () => {
 				phase: "finalizing",
 				explorationToolCalls: 2,
 				finalizingToolCalls: 2,
-				seenEvidenceRefs: ["artifact://first"],
+				seenEvidenceRefs: [trusted.evidence.id],
 			},
 		});
 	});
@@ -1033,7 +1034,8 @@ describe("AgentTaskGraph", () => {
 					delegatedTaskConvergence: {
 						maxToolCallsWithoutEvidence: 2,
 						maxToolCallsAfterSteer: 2,
-					} as never,
+						maxExplorationToolCalls: 0,
+					},
 				},
 			}),
 		).toThrow("delegatedTaskConvergence.maxExplorationToolCalls must be a positive integer");
@@ -1044,6 +1046,13 @@ describe("AgentTaskGraph", () => {
 				policy: { delegatedTaskConvergence: null } as never,
 			}),
 		).toThrow("delegatedTaskConvergence must be an object");
+		expect(() =>
+			AgentTaskGraph.open({
+				directory: invalidDirectory,
+				root: { ownerAgentId: "root-agent", objective: "Review" },
+				policy: { maxTotalTokens: 0 },
+			}),
+		).toThrow("maxTotalTokens must be a positive integer");
 		expect(existsSync(invalidDirectory)).toBe(false);
 	});
 
@@ -1055,7 +1064,11 @@ describe("AgentTaskGraph", () => {
 		const validatorError = new Error("host validator rejected completion");
 		const graph = AgentTaskGraph.open({
 			directory,
-			root: { ownerAgentId: "root-agent", objective: "Review" },
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review",
+				exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			},
 			policy: {
 				validateCompletion: () => {
 					throw validatorError;
@@ -1069,16 +1082,615 @@ describe("AgentTaskGraph", () => {
 			thrown = error;
 		}
 		expect(thrown).toBe(validatorError);
+		expect(graph.getTask(graph.rootTaskId).attempts.at(-1)?.handoff).toMatchObject({
+			summary: "done",
+			remainingClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+		});
 	});
 
 	it("publishes an immutable capability contract for policy consumers", () => {
 		expect(Object.isFrozen(AGENT_TASK_GRAPH_POLICY_CAPABILITIES)).toBe(true);
 		expect(AGENT_TASK_GRAPH_POLICY_CAPABILITIES).toEqual({
-			version: 2,
+			version: 3,
 			graphScopedExecutionProfile: true,
 			constrainedCompletionCorrection: true,
 			boundedDelegatedTaskConvergence: true,
+			durableTaskAttempts: true,
+			durableTaskHandoffs: true,
+			sharedTaskEvidence: true,
+			historicalDelegationCoverage: true,
+			sharedTaskBudget: true,
 		});
+	});
+
+	it("requires delegated owners to choose leaf execution or recursive coordination", () => {
+		directory = mkdtempSync(join(tmpdir(), "prime-task-plan-"));
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review",
+				exclusiveClaims: [claim("a.ts"), claim("b.ts"), claim("c.ts")],
+			},
+			policy: { requireExclusiveClaims: true, requireDelegatedTaskPlan: true },
+		});
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a and b",
+				scope: "a.ts and b.ts",
+				exclusiveClaims: [claim("a.ts"), claim("b.ts")],
+				delegationReason: "Separate runtime boundary",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		expect(() =>
+			graph.recordEvidence(child.id, "child-agent", {
+				kind: "repository-read",
+				subjects: ["a.ts"],
+				contentDigest: "a".repeat(64),
+			}),
+		).toThrow("must record a leaf-or-coordinator plan");
+		graph.recordPlan(child.id, "child-agent", {
+			mode: "coordinator",
+			rationale: "The two files have separable contracts",
+			boundaries: ["a.ts behavior", "b.ts behavior"],
+			expectedEvidence: ["host-pinned diff pages"],
+		});
+		const grandchild = graph.reserveDelegation({
+			parentTaskId: child.id,
+			callerAgentId: "child-agent",
+			childAgentId: "grandchild-agent",
+			task: {
+				objective: "Review a",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent contract",
+			},
+		});
+		expect(grandchild.parentTaskId).toBe(child.id);
+		graph.startTask(grandchild.id, "grandchild-agent");
+		graph.recordPlan(grandchild.id, "grandchild-agent", {
+			mode: "leaf",
+			rationale: "One focused file",
+			boundaries: ["a.ts"],
+			expectedEvidence: ["repository read"],
+		});
+		expect(() => graph.assertEvidenceScopeAvailable(grandchild.id, "grandchild-agent", [claim("b.ts")])).toThrow(
+			"is not authorized to inspect claim repo:file:b.ts",
+		);
+		expect(() =>
+			graph.recordEvidence(child.id, "child-agent", {
+				kind: "repository-read",
+				subjects: ["a.ts"],
+				claims: [claim("a.ts")],
+				contentDigest: "a".repeat(64),
+			}),
+		).toThrow("cannot inspect claim repo:file:a.ts while an active descendant owns it");
+	});
+
+	it("deduplicates trusted evidence and carries a failed attempt handoff into a narrower successor", () => {
+		directory = mkdtempSync(join(tmpdir(), "prime-task-handoff-"));
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review",
+				exclusiveClaims: [claim("a.ts"), claim("b.ts"), claim("c.ts")],
+			},
+			policy: {
+				requireExclusiveClaims: true,
+				requireDelegatedTaskPlan: true,
+				requireDelegationContractKey: true,
+			},
+		});
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review queue contract",
+				scope: "a.ts and b.ts",
+				exclusiveClaims: [claim("a.ts"), claim("b.ts")],
+				questions: ["Does the queue contract remain compatible?"],
+				delegationReason: "Independent behavioral contract",
+				contractKey: "queue-compatibility",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		graph.recordPlan(child.id, "child-agent", {
+			mode: "leaf",
+			rationale: "The contract fits one focused pass",
+			boundaries: ["queue payload"],
+			expectedEvidence: ["diff"],
+		});
+		const first = graph.recordEvidence(child.id, "child-agent", {
+			kind: "repository-diff",
+			subjects: ["a.ts"],
+			contentDigest: "b".repeat(64),
+			summary: "Pinned diff page",
+		});
+		const repeated = graph.recordEvidence(child.id, "child-agent", {
+			kind: "repository-diff",
+			subjects: ["a.ts"],
+			contentDigest: "b".repeat(64),
+		});
+		expect(first.novel).toBe(true);
+		expect(repeated.novel).toBe(false);
+		graph.recordHandoff(child.id, "child-agent", {
+			summary: "a.ts is safe; b.ts still needs caller analysis",
+			inspectedClaims: [claim("a.ts")],
+			remainingClaims: [claim("b.ts")],
+			evidenceIds: [first.evidence.id],
+			rejectedHypotheses: ["a.ts changes wire format"],
+			recommendedNextScopes: ["Inspect b.ts callers"],
+		});
+		graph.interruptTask(child.id, "child-agent", "provider transport failed");
+		const interrupted = graph.getTask(child.id);
+		expect(interrupted.attempts.at(-1)).toMatchObject({
+			status: "interrupted",
+			handoff: { remainingClaims: [claim("b.ts")], evidenceIds: [first.evidence.id] },
+		});
+
+		expect(() =>
+			graph.reserveDelegation({
+				parentTaskId: graph.rootTaskId,
+				callerAgentId: "root-agent",
+				childAgentId: "duplicate-agent",
+				task: {
+					objective: "Review queue contract again",
+					scope: "a.ts and b.ts",
+					exclusiveClaims: [claim("a.ts"), claim("b.ts")],
+					questions: ["Does the queue contract remain compatible?"],
+					delegationReason: "Retry",
+					contractKey: "queue-compatibility",
+				},
+			}),
+		).toThrow("exclusive claim coverage was already attempted");
+
+		const successor = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "successor-agent",
+			task: {
+				objective: "Finish queue caller analysis",
+				scope: "b.ts callers",
+				exclusiveClaims: [claim("b.ts")],
+				questions: ["Do callers handle the new queue contract?"],
+				delegationReason: "Continue the named remaining scope",
+				contractKey: "queue-compatibility",
+				predecessorTaskId: child.id,
+				repeatReason: "remaining_scope",
+			},
+		});
+		const context = graph.contextEnvelope(successor.id);
+		expect(context.relevantHandoffs).toContainEqual(
+			expect.objectContaining({ summary: expect.stringContaining("a.ts is safe") }),
+		);
+		expect(context.relevantEvidence).toContainEqual(expect.objectContaining({ id: first.evidence.id }));
+	});
+
+	it("injects previously recorded evidence into a delegated owner by claim", () => {
+		const graph = open();
+		const inherited = graph.recordEvidence(graph.rootTaskId, "root-agent", {
+			kind: "repository-diff",
+			subjects: ["a.ts"],
+			claims: [claim("a.ts")],
+			contentDigest: "c".repeat(64),
+			summary: "Root inspected the pinned diff before decomposition",
+		});
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent boundary",
+			},
+		});
+		const context = graph.contextEnvelope(child.id);
+		expect(context.evidenceRefs).toContain(inherited.evidence.id);
+		expect(context.relevantEvidence).toContainEqual(
+			expect.objectContaining({ id: inherited.evidence.id, claims: [claim("a.ts")] }),
+		);
+	});
+
+	it("permits provenance-linked revisits only for a contradiction or a genuinely new question", () => {
+		const graph = open();
+		const completed = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "first-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts behavior",
+				exclusiveClaims: [claim("a.ts")],
+				questions: ["Does the parser preserve empty values?"],
+				delegationReason: "Independent parser contract",
+			},
+		});
+		graph.startTask(completed.id, "first-agent");
+		graph.completeTaskFromRuntime(completed.id, "first-agent", "The parser preserves empty values");
+
+		expect(() =>
+			graph.reserveDelegation({
+				parentTaskId: graph.rootTaskId,
+				callerAgentId: "root-agent",
+				childAgentId: "invalid-agent",
+				task: {
+					objective: "Repeat the parser review",
+					scope: "a.ts behavior",
+					exclusiveClaims: [claim("a.ts")],
+					questions: ["Does the parser preserve empty values?"],
+					delegationReason: "Repeat the same review",
+					predecessorTaskId: completed.id,
+					repeatReason: "remaining_scope",
+				},
+			}),
+		).toThrow("is not permitted by remaining_scope");
+
+		expect(() =>
+			graph.reserveDelegation({
+				parentTaskId: graph.rootTaskId,
+				callerAgentId: "root-agent",
+				childAgentId: "renamed-question-agent",
+				task: {
+					objective: "Check a cross-boundary parser interaction",
+					scope: "a.ts interaction",
+					exclusiveClaims: [claim("a.ts")],
+					questions: ["  DOES   THE PARSER preserve EMPTY values? "],
+					delegationReason: "A caller exposed a new boundary",
+					predecessorTaskId: completed.id,
+					repeatReason: "new_cross_boundary_question",
+				},
+			}),
+		).toThrow("must add a review question");
+
+		const successor = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "cross-boundary-agent",
+			task: {
+				objective: "Check a cross-boundary parser interaction",
+				scope: "a.ts interaction with caller.ts",
+				exclusiveClaims: [claim("a.ts")],
+				questions: ["Can caller.ts distinguish an empty value from an absent value?"],
+				delegationReason: "A caller exposed a new behavioral boundary",
+				predecessorTaskId: completed.id,
+				repeatReason: "new_cross_boundary_question",
+			},
+		});
+		expect(graph.contextEnvelope(successor.id).relevantHandoffs).not.toHaveLength(0);
+	});
+
+	it("treats novel trusted evidence as convergence progress without requiring task.update", () => {
+		directory = mkdtempSync(join(tmpdir(), "prime-task-evidence-convergence-"));
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review",
+				exclusiveClaims: [claim("a.ts"), claim("b.ts")],
+			},
+			policy: {
+				requireDelegatedTaskPlan: true,
+				delegatedTaskConvergence: { maxToolCallsWithoutEvidence: 3, maxToolCallsAfterSteer: 2 },
+			},
+		});
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent boundary",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		graph.recordPlan(child.id, "child-agent", {
+			mode: "leaf",
+			rationale: "One focused file",
+			boundaries: ["a.ts"],
+			expectedEvidence: ["diff pages"],
+		});
+		graph.recordEvidence(child.id, "child-agent", {
+			kind: "repository-diff",
+			subjects: ["a.ts"],
+			contentDigest: "1".repeat(64),
+		});
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "child-agent", 2)).toMatchObject({
+			state: { phase: "exploring", toolCallsWithoutEvidence: 2 },
+		});
+		graph.recordEvidence(child.id, "child-agent", {
+			kind: "repository-read",
+			subjects: ["a.ts"],
+			contentDigest: "2".repeat(64),
+		});
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "child-agent", 1)).toMatchObject({
+			state: { phase: "exploring", toolCallsWithoutEvidence: 1 },
+			enteredFinalizing: false,
+		});
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "child-agent", 2)).toMatchObject({
+			state: { phase: "finalizing", toolCallsWithoutEvidence: 3 },
+			enteredFinalizing: true,
+		});
+	});
+
+	it("does not let model-authored evidence references reset convergence", () => {
+		directory = mkdtempSync(join(tmpdir(), "prime-task-untrusted-evidence-"));
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review",
+				exclusiveClaims: [claim("a.ts"), claim("b.ts")],
+			},
+			policy: {
+				requireDelegatedTaskPlan: true,
+				delegatedTaskConvergence: { maxToolCallsWithoutEvidence: 2, maxToolCallsAfterSteer: 1 },
+			},
+		});
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent boundary",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		graph.recordPlan(child.id, "child-agent", {
+			mode: "leaf",
+			rationale: "One focused file",
+			boundaries: ["a.ts"],
+			expectedEvidence: ["trusted diff"],
+		});
+		graph.updateProgress(child.id, "child-agent", {
+			summary: "Claimed evidence without a trusted host record",
+			evidenceRefs: ["model://invented-1"],
+		});
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "child-agent", 1)).toMatchObject({
+			state: { phase: "exploring", toolCallsWithoutEvidence: 1 },
+		});
+		graph.updateProgress(child.id, "child-agent", {
+			summary: "Claimed another reference",
+			evidenceRefs: ["model://invented-1", "model://invented-2"],
+		});
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "child-agent", 1)).toMatchObject({
+			state: { phase: "finalizing", toolCallsWithoutEvidence: 2 },
+			enteredFinalizing: true,
+		});
+	});
+
+	it("shares one host-owned token budget across the complete task graph", () => {
+		directory = mkdtempSync(join(tmpdir(), "prime-task-shared-budget-"));
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: { ownerAgentId: "root-agent", objective: "Review", exclusiveClaims: [claim("a.ts"), claim("b.ts")] },
+			policy: {
+				maxTotalTokens: 100,
+				requireDelegatedTaskPlan: true,
+				delegatedTaskConvergence: { maxToolCallsWithoutEvidence: 10, maxToolCallsAfterSteer: 1 },
+			},
+		});
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent boundary",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		graph.recordPlan(child.id, "child-agent", {
+			mode: "leaf",
+			rationale: "One focused file",
+			boundaries: ["a.ts"],
+			expectedEvidence: ["trusted diff"],
+		});
+		graph.recordUsage(graph.rootTaskId, { input: 40, output: 10 }, "root-agent");
+		graph.recordUsage(child.id, { input: 35, output: 15 }, "child-agent");
+		expect(graph.getSharedBudget()).toEqual({
+			maxTotalTokens: 100,
+			usedTokens: 100,
+			remainingTokens: 0,
+			exhausted: true,
+		});
+		expect(graph.contextEnvelope(child.id).sharedBudget?.exhausted).toBe(true);
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "child-agent", 0)).toMatchObject({
+			state: { phase: "finalizing" },
+			enteredFinalizing: true,
+		});
+		expect(() => graph.assertCanExplore(child.id, "child-agent")).toThrow("shared token budget is exhausted");
+		expect(() =>
+			graph.reserveDelegation({
+				parentTaskId: graph.rootTaskId,
+				callerAgentId: "root-agent",
+				childAgentId: "another-agent",
+				task: {
+					objective: "Review b",
+					scope: "b.ts",
+					exclusiveClaims: [claim("b.ts")],
+					delegationReason: "Independent boundary",
+				},
+			}),
+		).toThrow("shared token budget is exhausted");
+	});
+
+	it("synthesizes a durable fallback handoff before reclaiming failed claims", () => {
+		const graph = open();
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				questions: ["Is a correct?"],
+				delegationReason: "Independent boundary",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		graph.updateProgress(child.id, "child-agent", {
+			summary: "Read the changed implementation",
+			evidenceRefs: ["evidence-a"],
+		});
+		graph.interruptTask(child.id, "child-agent", "transport failed");
+		const failed = graph.getTask(child.id);
+		expect(failed.attempts.at(-1)?.handoff).toMatchObject({
+			summary: expect.stringContaining("Read the changed implementation"),
+			remainingClaims: [claim("a.ts")],
+			evidenceIds: ["evidence-a"],
+			unresolvedQuestions: ["Is a correct?"],
+		});
+		expect(graph.getTask(graph.rootTaskId).exclusiveClaims).toContainEqual(claim("a.ts"));
+	});
+
+	it("migrates version-one snapshots with synthetic attempts and handoffs", () => {
+		const graph = open();
+		graph.checkpoint();
+		const snapshotPath = join(directory!, "task-graph.snapshot.json");
+		const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as { tasks: Array<Record<string, unknown>> };
+		for (const task of snapshot.tasks) {
+			delete task.evidence;
+			delete task.attempts;
+		}
+		writeFileSync(snapshotPath, `${JSON.stringify(snapshot)}\n`);
+		const restored = AgentTaskGraph.open({
+			directory: directory!,
+			root: { ownerAgentId: "restored-root", objective: "Review" },
+			policy: { requireExclusiveClaims: true },
+		});
+		expect(restored.getTask(restored.rootTaskId).attempts).toHaveLength(2);
+		expect(restored.getTask(restored.rootTaskId).evidence).toEqual([]);
+		expect(restored.getTask(restored.rootTaskId).attempts[0]).toMatchObject({ status: "replaced" });
+	});
+
+	it("rejects broad historical retries and preserves narrow successor context across a 153-file review", () => {
+		directory = mkdtempSync(join(tmpdir(), "prime-task-pr31-regression-"));
+		const changedFiles = Array.from({ length: 153 }, (_, index) => claim(`src/file-${index}.ts`));
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: { ownerAgentId: "root-agent", objective: "Review PR #31", exclusiveClaims: changedFiles },
+			policy: {
+				requireExclusiveClaims: true,
+				requireDelegatedTaskPlan: true,
+				requireDelegationContractKey: true,
+			},
+		});
+		const broadClaims = changedFiles.slice(0, 50);
+		const broad = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "broad-agent",
+			task: {
+				objective: "Review the data-plane contract",
+				scope: "Fifty related data-plane files",
+				exclusiveClaims: broadClaims,
+				questions: ["Does the typed capability contract remain sound?"],
+				delegationReason: "One behavioral domain",
+				contractKey: "typed-data-plane-capabilities",
+			},
+		});
+		graph.startTask(broad.id, "broad-agent");
+		graph.recordPlan(broad.id, "broad-agent", {
+			mode: "coordinator",
+			rationale: "The scope contains separable queue and transport contracts",
+			boundaries: ["queue", "transport"],
+			expectedEvidence: ["pinned diff pages"],
+		});
+		const grandchildClaims = broadClaims.slice(0, 10);
+		const grandchild = graph.reserveDelegation({
+			parentTaskId: broad.id,
+			callerAgentId: "broad-agent",
+			childAgentId: "queue-agent",
+			task: {
+				objective: "Review the queue contract",
+				scope: "Ten queue files",
+				exclusiveClaims: grandchildClaims,
+				delegationReason: "Independent queue boundary",
+				contractKey: "typed-data-plane-queue",
+			},
+		});
+		graph.startTask(grandchild.id, "queue-agent");
+		graph.recordPlan(grandchild.id, "queue-agent", {
+			mode: "leaf",
+			rationale: "The queue boundary is focused",
+			boundaries: ["queue payload"],
+			expectedEvidence: ["diff pages"],
+		});
+		graph.completeTaskFromRuntime(grandchild.id, "queue-agent", "Queue contract is sound");
+		graph.interruptTask(broad.id, "broad-agent", "model provider exhausted");
+
+		expect(() =>
+			graph.reserveDelegation({
+				parentTaskId: graph.rootTaskId,
+				callerAgentId: "root-agent",
+				childAgentId: "breadth-retry-agent",
+				task: {
+					objective: "Retry the whole data-plane contract",
+					scope: "Fifty related data-plane files",
+					exclusiveClaims: broadClaims.slice(10),
+					questions: ["Try the typed capability review again"],
+					delegationReason: "Retry after failure",
+					contractKey: "fresh-key-cannot-bypass-history",
+				},
+			}),
+		).toThrow("exclusive claim coverage was already attempted");
+
+		const successor = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "narrow-successor-agent",
+			task: {
+				objective: "Finish the remaining data-plane scope",
+				scope: "Forty uninspected data-plane files",
+				exclusiveClaims: broadClaims.slice(10),
+				delegationReason: "Continue only the recorded remaining scope",
+				contractKey: "typed-data-plane-capabilities",
+				predecessorTaskId: broad.id,
+				repeatReason: "remaining_scope",
+			},
+		});
+		graph.startTask(successor.id, "narrow-successor-agent");
+		graph.recordPlan(successor.id, "narrow-successor-agent", {
+			mode: "coordinator",
+			rationale: "The remaining files still contain separable boundaries",
+			boundaries: ["remaining transport slice"],
+			expectedEvidence: ["descendant handoffs"],
+		});
+		expect(() =>
+			graph.reserveDelegation({
+				parentTaskId: successor.id,
+				callerAgentId: "narrow-successor-agent",
+				childAgentId: "cross-level-retry-agent",
+				task: {
+					objective: "Retry one historical file without its handoff",
+					scope: broadClaims[10]!.key,
+					exclusiveClaims: [broadClaims[10]!],
+					delegationReason: "Independent transport slice",
+					contractKey: "another-fresh-key",
+				},
+			}),
+		).toThrow("exclusive claim coverage was already attempted");
+		expect(graph.contextEnvelope(successor.id).relevantHandoffs[0]?.remainingClaims).toHaveLength(40);
+		expect(graph.contextEnvelope(graph.rootTaskId).relevantHandoffs).toContainEqual(
+			expect.objectContaining({ summary: "Queue contract is sound" }),
+		);
+		expect(graph.getSnapshot().totalTasks).toBe(4);
 	});
 
 	it("preserves omitted progress fields while allowing explicit clearing", () => {
