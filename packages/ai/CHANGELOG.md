@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.9.2] - 2026-09-04
+
+- Fixed Claude Fable 5.x failing over Anthropic OAuth with "Claude Code 2.1.75 does not support this model" by bumping the impersonated Claude Code version to 2.1.257 ([#1962](https://github.com/PrimeIntellect-ai/prime-agent/issues/1962))
+
 ## [0.9.0] - 2026-09-01
 
 - Refreshed the model catalog from live provider catalogs (pricing updates, new and removed models); fixed OpenCode Go Qwen routes mislabeled as Anthropic and excluded private dev/ Prime Inference routes.
