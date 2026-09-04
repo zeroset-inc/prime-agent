@@ -934,6 +934,46 @@ describe("AgentTaskGraph", () => {
 		expect(existsSync(invalidDirectory)).toBe(false);
 	});
 
+	it("ends delegated exploration immediately when the shared token budget is exhausted", () => {
+		directory = mkdtempSync(join(tmpdir(), "prime-task-budget-convergence-"));
+		const graph = AgentTaskGraph.open({
+			directory,
+			root: {
+				ownerAgentId: "root-agent",
+				objective: "Review",
+				exclusiveClaims: [claim("a.ts"), claim("b.ts")],
+			},
+			policy: {
+				maxTotalTokens: 10,
+				delegatedTaskConvergence: {
+					maxToolCallsWithoutEvidence: 24,
+					maxToolCallsAfterSteer: 8,
+				},
+			},
+		});
+		const child = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "child-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts",
+				exclusiveClaims: [claim("a.ts")],
+				delegationReason: "Independent boundary",
+			},
+		});
+		graph.startTask(child.id, "child-agent");
+		graph.recordUsage(graph.rootTaskId, { input: 10 }, "root-agent");
+
+		expect(graph.recordDelegatedTaskConvergenceTurn(child.id, "child-agent", 1)).toMatchObject({
+			state: { phase: "finalizing", explorationToolCalls: 1, finalizingToolCalls: 0 },
+			enteredFinalizing: true,
+			exhausted: true,
+			reason: "shared_budget",
+			remainingFinalizationToolCalls: 0,
+		});
+	});
+
 	it("persists convergence accounting across reassignment and recovery without authorizing the old actor", () => {
 		directory = mkdtempSync(join(tmpdir(), "prime-task-convergence-"));
 		const policy = {

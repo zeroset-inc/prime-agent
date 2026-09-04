@@ -159,6 +159,7 @@ export interface AgentTaskConvergenceUpdate {
 	state: AgentTaskConvergenceState;
 	enteredFinalizing: boolean;
 	exhausted: boolean;
+	reason?: "shared_budget" | "no_evidence" | "exploration_limit" | "finalization_limit";
 	remainingFinalizationToolCalls: number;
 }
 
@@ -1267,6 +1268,7 @@ export class AgentTaskGraph {
 			discoveredEvidence = true;
 		}
 		let enteredFinalizing = false;
+		let reason: AgentTaskConvergenceUpdate["reason"];
 		const nextState: AgentTaskConvergenceState = {
 			...current,
 			seenEvidenceRefs: [...seenEvidenceRefs],
@@ -1275,27 +1277,37 @@ export class AgentTaskGraph {
 			nextState.explorationToolCalls += turnToolCalls;
 			nextState.toolCallsWithoutEvidence =
 				(discoveredEvidence ? 0 : current.toolCallsWithoutEvidence) + turnToolCalls;
-			if (
-				nextState.toolCallsWithoutEvidence >= policy.maxToolCallsWithoutEvidence ||
-				this.getSharedBudget()?.exhausted === true ||
-				(policy.maxExplorationToolCalls !== undefined &&
-					nextState.explorationToolCalls >= policy.maxExplorationToolCalls)
+			if (this.getSharedBudget()?.exhausted === true) {
+				reason = "shared_budget";
+			} else if (nextState.toolCallsWithoutEvidence >= policy.maxToolCallsWithoutEvidence) {
+				reason = "no_evidence";
+			} else if (
+				policy.maxExplorationToolCalls !== undefined &&
+				nextState.explorationToolCalls >= policy.maxExplorationToolCalls
 			) {
+				reason = "exploration_limit";
+			}
+			if (reason) {
 				nextState.phase = "finalizing";
 				enteredFinalizing = true;
 			}
 		} else {
 			nextState.finalizingToolCalls += turnToolCalls;
+			if (this.getSharedBudget()?.exhausted === true) reason = "shared_budget";
 		}
 		const exhausted =
-			nextState.phase === "finalizing" && nextState.finalizingToolCalls >= policy.maxToolCallsAfterSteer;
+			reason === "shared_budget" ||
+			(nextState.phase === "finalizing" && nextState.finalizingToolCalls >= policy.maxToolCallsAfterSteer);
+		if (exhausted && !reason) reason = "finalization_limit";
 		const next = touchTask({ ...task, convergence: nextState });
 		this.commit("task.convergence_recorded", callerAgentId, [next]);
 		return {
 			state: clone(nextState),
 			enteredFinalizing,
 			exhausted,
-			remainingFinalizationToolCalls: Math.max(0, policy.maxToolCallsAfterSteer - nextState.finalizingToolCalls),
+			...(reason ? { reason } : {}),
+			remainingFinalizationToolCalls:
+				reason === "shared_budget" ? 0 : Math.max(0, policy.maxToolCallsAfterSteer - nextState.finalizingToolCalls),
 		};
 	}
 
