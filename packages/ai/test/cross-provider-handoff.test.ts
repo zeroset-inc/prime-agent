@@ -1,7 +1,7 @@
 import { writeFileSync } from "fs";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, it } from "vitest";
-import { getModel } from "../src/models.js";
+import { getModel, getModels } from "../src/models.js";
 import { completeSimple, getEnvApiKey } from "../src/stream.js";
 import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage } from "../src/types.js";
 import { hasAzureOpenAICredentials } from "./azure-utils.js";
@@ -25,6 +25,10 @@ interface ProviderModelPair {
 	label: string;
 	apiOverride?: Api;
 	upstreamApiKeyEnv?: string;
+}
+
+function getCloudflareGatewayModel(api: Api): string {
+	return getModels("cloudflare-ai-gateway").find((model) => model.api === api)?.id ?? `missing-${api}`;
 }
 
 const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
@@ -54,8 +58,14 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "cloudflare-workers-ai", model: "@cf/moonshotai/kimi-k2.6", label: "cloudflare-kimi-k2.6" },
 	{
 		provider: "cloudflare-ai-gateway",
-		model: "gpt-5.1",
-		label: "cloudflare-gateway-gpt-5.1",
+		model: getCloudflareGatewayModel("anthropic-messages"),
+		label: "cloudflare-gateway-anthropic",
+		upstreamApiKeyEnv: "ANTHROPIC_API_KEY",
+	},
+	{
+		provider: "cloudflare-ai-gateway",
+		model: getCloudflareGatewayModel("openai-responses"),
+		label: "cloudflare-gateway-openai",
 		upstreamApiKeyEnv: "OPENAI_API_KEY",
 	},
 	{ provider: "groq", model: "openai/gpt-oss-120b", label: "groq-gpt-oss-120b" },
