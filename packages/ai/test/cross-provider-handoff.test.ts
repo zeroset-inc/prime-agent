@@ -54,12 +54,6 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "cloudflare-workers-ai", model: "@cf/moonshotai/kimi-k2.6", label: "cloudflare-kimi-k2.6" },
 	{
 		provider: "cloudflare-ai-gateway",
-		model: "claude-sonnet-4.6",
-		label: "cloudflare-gateway-claude-sonnet-4.6",
-		upstreamApiKeyEnv: "ANTHROPIC_API_KEY",
-	},
-	{
-		provider: "cloudflare-ai-gateway",
 		model: "gpt-5.1",
 		label: "cloudflare-gateway-gpt-5.1",
 		upstreamApiKeyEnv: "OPENAI_API_KEY",
