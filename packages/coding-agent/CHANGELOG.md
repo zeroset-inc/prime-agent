@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.9.3] - 2026-09-04
+
+- Fixed delegated-task coordinator resumptions that could be lost when successful descendants completed concurrently.
+
 ## [0.9.2] - 2026-09-04
 
 - Added native callable tools for MCP servers supplied by ACP clients. ([#2002](https://github.com/PrimeIntellect-ai/prime-agent/pull/2002))
