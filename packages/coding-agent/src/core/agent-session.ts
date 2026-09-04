@@ -1313,6 +1313,7 @@ export class AgentSession {
 	private readonly _taskAccountedAssistantMessages = new WeakSet<AssistantMessage>();
 	private _taskAccountingError?: Error;
 	private _taskResumeDrain?: Promise<void>;
+	private _taskResumeDrainRequested = false;
 	private _quiescenceParent?: AgentSession;
 	private _repliedToParentSinceTask: boolean | undefined;
 	private _parentReplyCount = 0;
@@ -1719,10 +1720,16 @@ export class AgentSession {
 
 	private _drainPendingTaskResumes(): Promise<void> {
 		if (!this._taskGraph) return Promise.resolve();
+		// A task can become resumable while an earlier drain is awaiting owner
+		// admission. Preserve that edge and rescan before the shared drain settles.
+		this._taskResumeDrainRequested = true;
 		if (this._taskResumeDrain) return this._taskResumeDrain;
 		const drain = (async () => {
-			for (const request of this._taskGraph!.getPendingResumeRequests()) {
-				await this._dispatchTaskResume(request);
+			while (this._taskResumeDrainRequested) {
+				this._taskResumeDrainRequested = false;
+				for (const request of this._taskGraph!.getPendingResumeRequests()) {
+					await this._dispatchTaskResume(request);
+				}
 			}
 		})();
 		let tracked!: Promise<void>;
@@ -11625,6 +11632,9 @@ export class AgentSession {
 						await child.disposeAsync().catch(() => undefined);
 					}
 				}
+				if (delegatedTaskId && this._taskGraph) {
+					await this._drainPendingTaskResumes().catch(() => undefined);
+				}
 			} catch (error) {
 				const runError = error instanceof Error ? error : new Error(String(error));
 				let suppressTerminalMessage = false;
@@ -11693,7 +11703,7 @@ export class AgentSession {
 					}
 				}
 				if (delegatedTaskId && this._taskGraph) {
-					void this._drainPendingTaskResumes().catch(() => undefined);
+					await this._drainPendingTaskResumes().catch(() => undefined);
 				}
 				if (!run.detachedDeletion && childSession && this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
 					try {
