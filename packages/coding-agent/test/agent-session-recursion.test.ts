@@ -34,6 +34,7 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager, type SettingsStorage } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
+import { AgentTaskGraph, type AgentTaskResumeDispatch } from "../src/core/task-graph.js";
 import type { BashOperations } from "../src/core/tools/bash.js";
 import { type ActiveSessionState, resolveActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
@@ -127,6 +128,8 @@ interface InspectableRlmSession {
 	_deletedRlmChildIds: Set<string>;
 	_rlmQuiescenceWaitAborts: Set<AbortController>;
 	_createKernelHostHandlers(): HostRequestHandlers;
+	_dispatchTaskResume(request: AgentTaskResumeDispatch): Promise<"admitted" | "owner_unavailable">;
+	_drainPendingTaskResumes(): Promise<void>;
 	_reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void>;
 }
 
@@ -192,6 +195,8 @@ describe("AgentSession rlm recursion", () => {
 			sessionManager?: SessionManager;
 			settingsManager?: SettingsManager;
 			extensionsResult?: LoadExtensionsResult;
+			taskGraph?: AgentTaskGraph;
+			taskId?: string;
 		} = {},
 	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
@@ -244,6 +249,8 @@ describe("AgentSession rlm recursion", () => {
 			rlmDepth: options.depth,
 			rlmMaxDepth: options.maxDepth,
 			rlmSessionDir: options.rlmSessionDir,
+			taskGraph: options.taskGraph,
+			taskId: options.taskId,
 		});
 		return session;
 	}
@@ -333,6 +340,106 @@ describe("AgentSession rlm recursion", () => {
 		} finally {
 			vi.unstubAllEnvs();
 		}
+	});
+
+	it("drains task resumes requested while an earlier drain is in flight", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "lossless-resume-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "lossless-resume-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+			},
+		});
+		const root = createSession({ sessionManager, taskGraph: graph, taskId: graph.rootTaskId });
+		const internals = root as unknown as InspectableRlmSession;
+		const request = (id: string): AgentTaskResumeDispatch => ({
+			id,
+			taskId: graph.rootTaskId,
+			ownerAgentId: sessionManager.getSessionId(),
+			reason: "descendants_terminal",
+			gapIds: [],
+			gapCount: 0,
+			status: "pending",
+			requestedAt: new Date().toISOString(),
+			gaps: [],
+			context: graph.contextEnvelope(graph.rootTaskId),
+		});
+		vi.spyOn(graph, "getPendingResumeRequests")
+			.mockReturnValueOnce([request("first")])
+			.mockReturnValueOnce([request("second")]);
+
+		const firstDispatchStarted = deferred<void>();
+		const releaseFirstDispatch = deferred<void>();
+		const dispatched: string[] = [];
+		internals._dispatchTaskResume = async (pending) => {
+			dispatched.push(pending.id);
+			if (pending.id === "first") {
+				firstDispatchStarted.resolve();
+				await releaseFirstDispatch.promise;
+			}
+			return "admitted";
+		};
+
+		const firstDrain = internals._drainPendingTaskResumes();
+		await firstDispatchStarted.promise;
+		const secondDrain = internals._drainPendingTaskResumes();
+		releaseFirstDispatch.resolve();
+		await Promise.all([firstDrain, secondDrain]);
+
+		expect(dispatched).toEqual(["first", "second"]);
+		await root.disposeAsync();
+	});
+
+	it("resumes a waiting coordinator after its final delegated child succeeds", async () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "successful-child-resume-sessions"));
+		const graph = AgentTaskGraph.open({
+			directory: join(tempDir, "successful-child-resume-coordination"),
+			root: {
+				ownerAgentId: sessionManager.getSessionId(),
+				objective: "Review the change",
+				exclusiveClaims: [
+					{ namespace: "repo:file", key: "runtime.ts" },
+					{ namespace: "repo:file", key: "other.ts" },
+				],
+			},
+			policy: { requireExclusiveClaims: true },
+		});
+		const releaseChild = deferred<void>();
+		const root = createSession({
+			sessionManager,
+			maxDepth: 1,
+			taskGraph: graph,
+			taskId: graph.rootTaskId,
+			streamFn: (_model, context) => {
+				const stream = createAssistantMessageEventStream();
+				void releaseChild.promise.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(`done: ${userText(context)}`) });
+				});
+				return stream;
+			},
+		});
+		const child = await root.delegateRlmChild("Review runtime.ts", {
+			objective: "Review runtime behavior",
+			scope: "runtime.ts",
+			exclusiveClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+			delegationReason: "Independent runtime boundary",
+		});
+		const handlers = (root as unknown as InspectableRlmSession)._createKernelHostHandlers();
+		await expect(handlers["rlm.task.defer_until_children_complete"]?.({})).resolves.toMatchObject({
+			state: "waiting",
+		});
+
+		releaseChild.resolve();
+		await waitFor(() => graph.getTask(child.task_id!).status === "completed");
+		await waitFor(() =>
+			root.messages.some((message) => message.role === "custom" && message.customType === "agent_task_resume"),
+		);
+		expect(graph.getTask(graph.rootTaskId)).toMatchObject({
+			status: "running",
+			resumeRequest: { reason: "descendants_terminal", status: "admitted" },
+		});
+		await root.disposeAsync();
 	});
 
 	it("keeps a forked root at depth zero so recursion remains allowed", async () => {
