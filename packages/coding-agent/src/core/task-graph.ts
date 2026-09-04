@@ -7,15 +7,23 @@ export const AGENT_TASK_TEXT_MAX_LENGTH = 4_000;
 export const AGENT_TASK_LIST_MAX_ITEMS = 256;
 export const AGENT_TASK_CLAIM_MAX_ITEMS = 5_000;
 export const AGENT_TASK_RESULT_MAX_BYTES = 64 * 1024;
+export const AGENT_TASK_HANDOFF_MAX_BYTES = 32 * 1024;
+export const AGENT_TASK_CONTEXT_HANDOFF_MAX_ITEMS = 16;
+export const AGENT_TASK_CONTEXT_EVIDENCE_MAX_ITEMS = 64;
 export const AGENT_TASK_SNAPSHOT_PAGE_MAX_ITEMS = 100;
 export const AGENT_TASK_SNAPSHOT_COMPACT_EVENT_THRESHOLD = 128;
 export const AGENT_TASK_SNAPSHOT_COMPACT_BYTE_THRESHOLD = 512 * 1024;
 /** Immutable runtime capability advertisement for hosts that configure task-graph policies. */
 export const AGENT_TASK_GRAPH_POLICY_CAPABILITIES = Object.freeze({
-	version: 2,
+	version: 3,
 	graphScopedExecutionProfile: true,
 	constrainedCompletionCorrection: true,
 	boundedDelegatedTaskConvergence: true,
+	durableTaskAttempts: true,
+	durableTaskHandoffs: true,
+	sharedTaskEvidence: true,
+	historicalDelegationCoverage: true,
+	sharedTaskBudget: true,
 } as const);
 
 export type AgentTaskStatus =
@@ -51,10 +59,75 @@ export interface AgentTaskContextEnvelope {
 	knownDecisions: string[];
 	dependencies: string[];
 	evidenceRefs: string[];
+	plan?: AgentTaskPlan;
+	currentAttempt?: AgentTaskAttempt;
+	relevantHandoffs: AgentTaskHandoff[];
+	relevantEvidence: AgentTaskEvidence[];
+	sharedBudget?: AgentTaskSharedBudget;
 	unresolvedQuestions: string[];
 	verificationExpectations: string[];
 	resultSchema?: Record<string, unknown>;
 	version: number;
+}
+
+export interface AgentTaskPlan {
+	mode: "leaf" | "coordinator";
+	rationale: string;
+	boundaries: string[];
+	expectedEvidence: string[];
+	recordedAt: string;
+}
+
+export interface AgentTaskEvidenceInput {
+	kind: string;
+	subjects: string[];
+	/** Resource claims whose contents this evidence operation will inspect. */
+	claims?: AgentTaskResourceClaim[];
+	contentDigest: string;
+	summary?: string;
+	artifactRef?: string;
+}
+
+export interface AgentTaskEvidence extends AgentTaskEvidenceInput {
+	id: string;
+	producedByTaskId: string;
+	producedByAttemptId: string;
+	createdAt: string;
+}
+
+export interface AgentTaskHandoffInput {
+	summary: string;
+	inspectedClaims?: AgentTaskResourceClaim[];
+	remainingClaims?: AgentTaskResourceClaim[];
+	evidenceIds?: string[];
+	candidateFindings?: unknown[];
+	rejectedHypotheses?: string[];
+	verification?: unknown[];
+	unresolvedQuestions?: string[];
+	recommendedNextScopes?: string[];
+}
+
+export interface AgentTaskHandoff {
+	summary: string;
+	inspectedClaims: AgentTaskResourceClaim[];
+	remainingClaims: AgentTaskResourceClaim[];
+	evidenceIds: string[];
+	candidateFindings: unknown[];
+	rejectedHypotheses: string[];
+	verification: unknown[];
+	unresolvedQuestions: string[];
+	recommendedNextScopes: string[];
+	createdAt: string;
+}
+
+export interface AgentTaskAttempt {
+	id: string;
+	agentId: string;
+	status: "pending" | "running" | "completed" | "interrupted" | "cancelled" | "replaced";
+	predecessorAttemptId?: string;
+	startedAt?: string;
+	endedAt?: string;
+	handoff?: AgentTaskHandoff;
 }
 
 export interface AgentTaskRootContextDescriptor {
@@ -87,6 +160,13 @@ export interface AgentTaskConvergenceUpdate {
 	enteredFinalizing: boolean;
 	exhausted: boolean;
 	remainingFinalizationToolCalls: number;
+}
+
+export interface AgentTaskSharedBudget {
+	maxTotalTokens: number;
+	usedTokens: number;
+	remainingTokens: number;
+	exhausted: boolean;
 }
 
 export interface AgentTaskResult {
@@ -165,6 +245,12 @@ export interface AgentTask {
 	verificationExpectations: string[];
 	resultSchema?: Record<string, unknown>;
 	delegationReason?: string;
+	contractKey?: string;
+	predecessorTaskId?: string;
+	repeatReason?: "remaining_scope" | "recorded_gap" | "contradiction" | "new_cross_boundary_question";
+	plan?: AgentTaskPlan;
+	evidence: AgentTaskEvidence[];
+	attempts: AgentTaskAttempt[];
 	status: AgentTaskStatus;
 	delegationState: AgentTaskDelegationState;
 	progress?: AgentTaskProgress;
@@ -251,6 +337,9 @@ export interface AgentTaskDelegationInput {
 	verificationExpectations?: string[];
 	resultSchema?: Record<string, unknown>;
 	delegationReason: string;
+	contractKey?: string;
+	predecessorTaskId?: string;
+	repeatReason?: "remaining_scope" | "recorded_gap" | "contradiction" | "new_cross_boundary_question";
 }
 
 export interface AgentTaskDelegationValidationRequest {
@@ -267,6 +356,10 @@ export interface AgentTaskCompletionValidationRequest {
 
 export interface AgentTaskGraphPolicy {
 	requireExclusiveClaims?: boolean;
+	requireDelegatedTaskPlan?: boolean;
+	requireDelegationContractKey?: boolean;
+	/** Optional host-owned token budget shared by the complete task graph. */
+	maxTotalTokens?: number;
 	validateDelegation?: (request: AgentTaskDelegationValidationRequest) => void;
 	validateCompletion?: (request: AgentTaskCompletionValidationRequest) => void;
 	/** Optional host policy for long-running delegated tasks. Prime observes
@@ -274,7 +367,8 @@ export interface AgentTaskGraphPolicy {
 	delegatedTaskConvergence?: {
 		maxToolCallsWithoutEvidence: number;
 		maxToolCallsAfterSteer: number;
-		maxExplorationToolCalls: number;
+		/** Optional emergency ceiling. Omit to converge only when evidence stops advancing. */
+		maxExplorationToolCalls?: number;
 	};
 	/** Opts delegated tasks into one correction turn after an automatic
 	 * completion fails host validation. The correction must explicitly submit
@@ -388,6 +482,7 @@ export class AgentTaskGraph {
 		const next = touchTask({
 			...root,
 			ownerAgentId: normalizedOwner,
+			attempts: rebindActiveAttempt(root, normalizedOwner, "Root session rebound"),
 			...(root.resumeRequest ? { resumeRequest: { ...root.resumeRequest, ownerAgentId: normalizedOwner } } : {}),
 		});
 		this.commit("graph.root_rebound", normalizedOwner, [next], { rootAgentId: normalizedOwner });
@@ -525,6 +620,24 @@ export class AgentTaskGraph {
 	contextEnvelope(taskId: string): AgentTaskContextEnvelope {
 		const task = this.findTask(taskId);
 		const root = this.findTask(this.state.rootTaskId);
+		const sharedBudget = this.getSharedBudget();
+		const handoffs = this.handoffsForTask(task);
+		const taskClaims = [...task.exclusiveClaims, ...task.sharedClaims];
+		const allEvidence = this.state.tasks.flatMap((candidate) => candidate.evidence);
+		const claimEvidence = allEvidence.filter((evidence) =>
+			(evidence.claims ?? []).some((evidenceClaim) =>
+				taskClaims.some((taskClaim) => sameClaim(evidenceClaim, taskClaim)),
+			),
+		);
+		const evidenceIds = new Set([
+			...(task.progress?.evidenceRefs ?? []),
+			...task.evidence.map((evidence) => evidence.id),
+			...claimEvidence.map((evidence) => evidence.id),
+			...handoffs.flatMap((handoff) => handoff.evidenceIds),
+		]);
+		const relevantEvidence = allEvidence
+			.filter((evidence) => evidenceIds.has(evidence.id))
+			.slice(-AGENT_TASK_CONTEXT_EVIDENCE_MAX_ITEMS);
 		return {
 			rootObjective: root.objective,
 			...(this.state.inheritedContext
@@ -544,7 +657,12 @@ export class AgentTaskGraph {
 			invariants: [...task.invariants],
 			knownDecisions: [...task.knownDecisions],
 			dependencies: [...task.dependencies],
-			evidenceRefs: [...(task.progress?.evidenceRefs ?? [])],
+			evidenceRefs: [...evidenceIds],
+			...(task.plan ? { plan: clone(task.plan) } : {}),
+			...(currentAttempt(task) ? { currentAttempt: clone(currentAttempt(task)!) } : {}),
+			relevantHandoffs: clone(handoffs),
+			relevantEvidence: clone(relevantEvidence),
+			...(sharedBudget ? { sharedBudget } : {}),
 			unresolvedQuestions: [...(task.result?.unresolvedQuestions ?? [])],
 			verificationExpectations: [...task.verificationExpectations],
 			...(task.resultSchema ? { resultSchema: clone(task.resultSchema) } : {}),
@@ -624,7 +742,19 @@ export class AgentTaskGraph {
 		const parent = this.findTask(input.parentTaskId);
 		this.assertOwner(parent, input.callerAgentId);
 		this.assertActive(parent, "delegate from");
+		this.assertSharedBudgetAvailable();
+		if (this.policy.requireDelegatedTaskPlan && parent.parentTaskId && !parent.plan) {
+			throw new AgentTaskGraphError(`task ${parent.id} must record a leaf-or-coordinator plan before delegating`);
+		}
+		if (parent.plan?.mode === "leaf") {
+			throw new AgentTaskGraphError(
+				`task ${parent.id} planned as a leaf and must revise its plan before delegating`,
+			);
+		}
 		const normalized = normalizeDelegationInput(input.task);
+		if (this.policy.requireDelegationContractKey && !normalized.contractKey) {
+			throw new AgentTaskGraphError("delegated task must include a stable contractKey");
+		}
 		if (!isMeaningfullyNarrower(parent, normalized)) {
 			throw new AgentTaskGraphError("delegated task must be meaningfully narrower than its parent task");
 		}
@@ -671,6 +801,32 @@ export class AgentTaskGraph {
 		);
 		if (duplicate)
 			throw new AgentTaskGraphError(`substantially identical delegated task already exists: ${duplicate.id}`);
+		const historicalDuplicate = this.state.tasks
+			.filter((task) => !ACTIVE_TASK_STATUSES.has(task.status) && historicallyOverlaps(task, normalized))
+			.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id))[0];
+		if (historicalDuplicate && normalized.predecessorTaskId !== historicalDuplicate.id) {
+			throw new AgentTaskGraphError(
+				`exclusive claim coverage was already attempted by ${historicalDuplicate.id}; link the latest attempt as predecessorTaskId and name a repeatReason`,
+			);
+		}
+		if (normalized.predecessorTaskId) {
+			const predecessor = this.findTask(normalized.predecessorTaskId);
+			if (ACTIVE_TASK_STATUSES.has(predecessor.status)) {
+				throw new AgentTaskGraphError("predecessorTaskId must identify a terminal task in this graph");
+			}
+			if (!normalized.repeatReason) {
+				throw new AgentTaskGraphError("a successor delegation must include repeatReason");
+			}
+			const handoff = lastHandoff(predecessor);
+			if (!handoff) throw new AgentTaskGraphError(`predecessor task ${predecessor.id} has no durable handoff`);
+			for (const claim of exclusiveClaims) {
+				if (!handoff.remainingClaims.some((remaining) => sameClaim(remaining, claim))) {
+					throw new AgentTaskGraphError(
+						`successor claim ${claimKey(claim)} was not left remaining by ${predecessor.id}`,
+					);
+				}
+			}
+		}
 		this.policy.validateDelegation?.({
 			parent: clone(parent),
 			child: clone(normalized),
@@ -695,6 +851,11 @@ export class AgentTaskGraph {
 			verificationExpectations: [...normalized.verificationExpectations],
 			...(normalized.resultSchema ? { resultSchema: clone(normalized.resultSchema) } : {}),
 			delegationReason: normalized.delegationReason,
+			...(normalized.contractKey ? { contractKey: normalized.contractKey } : {}),
+			...(normalized.predecessorTaskId ? { predecessorTaskId: normalized.predecessorTaskId } : {}),
+			...(normalized.repeatReason ? { repeatReason: normalized.repeatReason } : {}),
+			evidence: [],
+			attempts: [createAttempt(input.childAgentId, "pending")],
 			status: "pending",
 			delegationState: "retained",
 			gaps: [],
@@ -725,6 +886,11 @@ export class AgentTaskGraph {
 		const next = touchTask({
 			...task,
 			status: "running",
+			attempts: updateCurrentAttempt(task, callerAgentId, (attempt) => ({
+				...attempt,
+				status: "running",
+				startedAt: attempt.startedAt ?? new Date().toISOString(),
+			})),
 			...(task.resumeRequest?.status === "pending"
 				? {
 						resumeRequest: {
@@ -736,6 +902,106 @@ export class AgentTaskGraph {
 				: {}),
 		});
 		this.commit("task.started", callerAgentId, [next]);
+		return clone(next);
+	}
+
+	recordPlan(taskId: string, callerAgentId: string, plan: Omit<AgentTaskPlan, "recordedAt">): AgentTask {
+		const task = this.findTask(taskId);
+		this.assertOwner(task, callerAgentId);
+		this.assertActive(task, "plan");
+		if (task.evidence.length > 0 || this.childrenOf(task.id).length > 0) {
+			throw new AgentTaskGraphError(`task ${task.id} must record its plan before exploration or delegation`);
+		}
+		const normalized = normalizeTaskPlan(plan);
+		const next = touchTask({ ...task, plan: { ...normalized, recordedAt: new Date().toISOString() } });
+		this.commit("task.planned", callerAgentId, [next]);
+		return clone(next);
+	}
+
+	assertCanExplore(taskId: string, callerAgentId: string): void {
+		const task = this.findTask(taskId);
+		this.assertOwner(task, callerAgentId);
+		this.assertActive(task, "explore");
+		if (this.policy.requireDelegatedTaskPlan && task.parentTaskId && !task.plan) {
+			throw new AgentTaskGraphError(`task ${task.id} must record a leaf-or-coordinator plan before exploration`);
+		}
+		this.assertSharedBudgetAvailable();
+	}
+
+	assertEvidenceScopeAvailable(taskId: string, callerAgentId: string, claims: AgentTaskResourceClaim[]): void {
+		this.assertCanExplore(taskId, callerAgentId);
+		const task = this.findTask(taskId);
+		const normalizedClaims = normalizeClaims(claims, "evidence claims");
+		const transferredClaims = this.state.tasks
+			.filter((candidate) => candidate.id !== task.id && this.isDescendant(task.id, candidate.id))
+			.filter((candidate) => ACTIVE_TASK_STATUSES.has(candidate.status))
+			.flatMap((candidate) => candidate.exclusiveClaims);
+		const repeated = normalizedClaims.find((claim) =>
+			transferredClaims.some((transferred) => sameClaim(transferred, claim)),
+		);
+		if (repeated) {
+			throw new AgentTaskGraphError(
+				`task ${task.id} cannot inspect claim ${claimKey(repeated)} while an active descendant owns it`,
+			);
+		}
+		const unauthorized = normalizedClaims.find(
+			(claim) =>
+				!task.exclusiveClaims.some((owned) => sameClaim(owned, claim)) &&
+				!task.sharedClaims.some((shared) => sameClaim(shared, claim)),
+		);
+		if (unauthorized) {
+			throw new AgentTaskGraphError(`task ${task.id} is not authorized to inspect claim ${claimKey(unauthorized)}`);
+		}
+	}
+
+	recordEvidence(
+		taskId: string,
+		callerAgentId: string,
+		rawEvidence: AgentTaskEvidenceInput,
+	): { evidence: AgentTaskEvidence; novel: boolean; task: AgentTask } {
+		const task = this.findTask(taskId);
+		const evidenceInput = normalizeTaskEvidenceInput(rawEvidence);
+		this.assertEvidenceScopeAvailable(taskId, callerAgentId, evidenceInput.claims ?? []);
+		const identity = evidenceIdentity(evidenceInput);
+		const existing = this.state.tasks
+			.flatMap((candidate) => candidate.evidence)
+			.find((evidence) => evidenceIdentity(evidence) === identity);
+		const evidence = existing ?? {
+			...evidenceInput,
+			id: `evidence-${identity}`,
+			producedByTaskId: task.id,
+			producedByAttemptId: requireCurrentAttempt(task).id,
+			createdAt: new Date().toISOString(),
+		};
+		const evidenceRefs = mergeStrings(task.progress?.evidenceRefs ?? [], [evidence.id]);
+		if (existing && evidenceRefs.length === (task.progress?.evidenceRefs.length ?? 0)) {
+			return { evidence: clone(evidence), novel: false, task: clone(task) };
+		}
+		const now = new Date().toISOString();
+		const next = touchTask({
+			...task,
+			evidence: existing ? task.evidence : [...task.evidence, evidence],
+			progress: {
+				summary: task.progress?.summary ?? `Recorded ${evidence.kind} evidence`,
+				evidenceRefs,
+				completedQuestions: task.progress?.completedQuestions ?? [],
+				updatedAt: now,
+			},
+		});
+		this.commit(existing ? "task.evidence_reused" : "task.evidence_recorded", callerAgentId, [next]);
+		return { evidence: clone(evidence), novel: !existing, task: clone(next) };
+	}
+
+	recordHandoff(taskId: string, callerAgentId: string, rawHandoff: AgentTaskHandoffInput): AgentTask {
+		const task = this.findTask(taskId);
+		this.assertOwner(task, callerAgentId);
+		this.assertActive(task, "record a handoff for");
+		const handoff = normalizeTaskHandoff(rawHandoff, task);
+		const next = touchTask({
+			...task,
+			attempts: updateCurrentAttempt(task, callerAgentId, (attempt) => ({ ...attempt, handoff })),
+		});
+		this.commit("task.handoff_recorded", callerAgentId, [next]);
 		return clone(next);
 	}
 
@@ -753,6 +1019,11 @@ export class AgentTaskGraph {
 		const next = touchTask({
 			...task,
 			status: "running",
+			attempts: updateCurrentAttempt(task, callerAgentId, (attempt) => ({
+				...attempt,
+				status: "running",
+				startedAt: attempt.startedAt ?? new Date().toISOString(),
+			})),
 			resumeRequest: {
 				...request,
 				status: "admitted",
@@ -890,8 +1161,27 @@ export class AgentTaskGraph {
 		if (task.gaps.some((gap) => gap.status === "open")) {
 			throw new AgentTaskGraphError(`task ${taskId} still has open gaps`);
 		}
-		this.policy.validateCompletion?.({ task: clone(task), result: clone(result), snapshot: clone(this.state) });
-		const next = touchTask({ ...task, status: "completed", result });
+		try {
+			this.policy.validateCompletion?.({ task: clone(task), result: clone(result), snapshot: clone(this.state) });
+		} catch (error) {
+			const rejectedHandoff = handoffFromRejectedResult(task, result);
+			const next = touchTask({
+				...task,
+				attempts: updateCurrentAttempt(task, callerAgentId, (attempt) => ({
+					...attempt,
+					handoff: rejectedHandoff,
+				})),
+			});
+			this.commit("task.handoff_recorded", callerAgentId, [next]);
+			throw error;
+		}
+		const handoff = handoffFromResult(task, result);
+		const next = touchTask({
+			...task,
+			status: "completed",
+			result,
+			attempts: finishCurrentAttempt(task, callerAgentId, "completed", handoff),
+		});
 		this.commit("task.completed", callerAgentId, [next]);
 		return clone(next);
 	}
@@ -928,7 +1218,7 @@ export class AgentTaskGraph {
 		| {
 				maxToolCallsWithoutEvidence: number;
 				maxToolCallsAfterSteer: number;
-				maxExplorationToolCalls: number;
+				maxExplorationToolCalls?: number;
 		  }
 		| undefined {
 		this.findTask(taskId);
@@ -951,7 +1241,7 @@ export class AgentTaskGraph {
 		const current = task.convergence ?? emptyConvergenceState();
 		const seenEvidenceRefs = new Set(current.seenEvidenceRefs);
 		let discoveredEvidence = false;
-		for (const evidenceRef of task.progress?.evidenceRefs ?? []) {
+		for (const evidenceRef of task.evidence.map((evidence) => evidence.id)) {
 			if (seenEvidenceRefs.has(evidenceRef)) continue;
 			seenEvidenceRefs.add(evidenceRef);
 			discoveredEvidence = true;
@@ -967,7 +1257,9 @@ export class AgentTaskGraph {
 				(discoveredEvidence ? 0 : current.toolCallsWithoutEvidence) + turnToolCalls;
 			if (
 				nextState.toolCallsWithoutEvidence >= policy.maxToolCallsWithoutEvidence ||
-				nextState.explorationToolCalls >= policy.maxExplorationToolCalls
+				this.getSharedBudget()?.exhausted === true ||
+				(policy.maxExplorationToolCalls !== undefined &&
+					nextState.explorationToolCalls >= policy.maxExplorationToolCalls)
 			) {
 				nextState.phase = "finalizing";
 				enteredFinalizing = true;
@@ -996,33 +1288,52 @@ export class AgentTaskGraph {
 		return this.policy.executionProfile;
 	}
 
-	interruptTask(taskId: string, callerAgentId: string, reason: string): AgentTask {
+	interruptTask(taskId: string, callerAgentId: string, reason: string, handoff?: AgentTaskHandoffInput): AgentTask {
 		const task = this.findTask(taskId);
 		if (task.status === "completed" || task.status === "cancelled" || task.status === "interrupted")
 			return clone(task);
 		if (callerAgentId !== task.ownerAgentId) this.assertCanSupervise(task, callerAgentId);
-		const changed = this.cancelSubtree(task, "interrupted", reason);
+		const changed = this.cancelSubtree(task, "interrupted", reason, handoff);
 		this.commit("task.interrupted", callerAgentId, changed);
 		return this.getTask(taskId);
 	}
 
-	cancelTask(taskId: string, callerAgentId: string, reason: string): AgentTask {
+	cancelTask(taskId: string, callerAgentId: string, reason: string, handoff?: AgentTaskHandoffInput): AgentTask {
 		const task = this.findTask(taskId);
 		this.assertCanSupervise(task, callerAgentId);
-		const changed = this.cancelSubtree(task, "cancelled", reason);
+		const changed = this.cancelSubtree(task, "cancelled", reason, handoff);
 		this.commit("task.cancelled", callerAgentId, changed);
 		return this.getTask(taskId);
 	}
 
-	reassignTask(taskId: string, callerAgentId: string, newOwnerAgentId: string): AgentTask {
+	reassignTask(
+		taskId: string,
+		callerAgentId: string,
+		newOwnerAgentId: string,
+		handoff?: AgentTaskHandoffInput,
+	): AgentTask {
 		const task = this.findTask(taskId);
 		this.assertCanSupervise(task, callerAgentId);
 		this.assertActive(task, "reassign");
 		const ownerAgentId = normalizeIdentifier(newOwnerAgentId, "newOwnerAgentId");
+		const previousAttempt = requireCurrentAttempt(task);
+		const durableHandoff = normalizeTaskHandoff(
+			handoff ?? fallbackHandoff(task, "Replaced by supervising agent"),
+			task,
+		);
 		const next = touchTask({
 			...task,
 			ownerAgentId,
 			childAgentId: ownerAgentId,
+			status: task.status,
+			attempts: [
+				...finishCurrentAttempt(task, task.ownerAgentId, "replaced", durableHandoff),
+				createAttempt(
+					ownerAgentId,
+					task.status === "pending" || task.status === "starting" ? "pending" : "running",
+					previousAttempt.id,
+				),
+			],
 			...(task.resumeRequest ? { resumeRequest: { ...task.resumeRequest, ownerAgentId } } : {}),
 		});
 		this.commit("task.reassigned", callerAgentId, [next]);
@@ -1060,6 +1371,19 @@ export class AgentTaskGraph {
 			}),
 			{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
 		);
+	}
+
+	getSharedBudget(): AgentTaskSharedBudget | undefined {
+		const maxTotalTokens = this.policy.maxTotalTokens;
+		if (maxTotalTokens === undefined) return undefined;
+		const usage = this.getTotalUsage();
+		const usedTokens = usage.input + usage.output;
+		return {
+			maxTotalTokens,
+			usedTokens,
+			remainingTokens: Math.max(0, maxTotalTokens - usedTokens),
+			exhausted: usedTokens >= maxTotalTokens,
+		};
 	}
 
 	getUsageAttributions(): Array<AgentTaskUsageAttribution & { taskId: string }> {
@@ -1158,6 +1482,8 @@ export class AgentTaskGraph {
 			...(root.resultSchema ? { resultSchema: clone(root.resultSchema) } : {}),
 			status: "running",
 			delegationState: "retained",
+			evidence: [],
+			attempts: [createAttempt(root.ownerAgentId, "running")],
 			gaps: [],
 			usage: emptyUsage(),
 			usageAttributions: [],
@@ -1198,6 +1524,7 @@ export class AgentTaskGraph {
 								...root,
 								ownerAgentId: rootAgentId,
 								status: recoveredRootStatus,
+								attempts: rebindActiveAttempt(root, rootAgentId, "Root session recovered"),
 								...(root.resumeRequest
 									? { resumeRequest: { ...root.resumeRequest, ownerAgentId: rootAgentId } }
 									: {}),
@@ -1425,10 +1752,19 @@ export class AgentTaskGraph {
 		chmodSync(this.snapshotPath, 0o600);
 	}
 
-	private cancelSubtree(task: AgentTask, status: "cancelled" | "interrupted", reason: string): AgentTask[] {
+	private cancelSubtree(
+		task: AgentTask,
+		status: "cancelled" | "interrupted",
+		reason: string,
+		handoff?: AgentTaskHandoffInput,
+	): AgentTask[] {
 		const subtree = this.collectActiveSubtree(task);
-		const changed = subtree.map((candidate) =>
-			touchTask({
+		const changed = subtree.map((candidate) => {
+			const durableHandoff = normalizeTaskHandoff(
+				candidate.id === task.id && handoff ? handoff : fallbackHandoff(candidate, reason),
+				candidate,
+			);
+			return touchTask({
 				...candidate,
 				status,
 				result: {
@@ -1439,9 +1775,10 @@ export class AgentTaskGraph {
 					coverageGaps: [],
 					evidenceRefs: candidate.progress?.evidenceRefs ?? [],
 				},
+				attempts: finishCurrentAttempt(candidate, candidate.ownerAgentId, status, durableHandoff),
 				reclaimedAt: new Date().toISOString(),
-			}),
-		);
+			});
+		});
 		if (task.parentTaskId) {
 			const parent = this.findTask(task.parentTaskId);
 			const reclaimed = subtree.reduce(
@@ -1464,6 +1801,20 @@ export class AgentTaskGraph {
 			if (ACTIVE_TASK_STATUSES.has(child.status)) tasks.push(...this.collectActiveSubtree(child));
 		}
 		return tasks;
+	}
+
+	private handoffsForTask(task: AgentTask): AgentTaskHandoff[] {
+		const predecessor = task.predecessorTaskId ? this.findTask(task.predecessorTaskId) : undefined;
+		const descendants = this.state.tasks.filter(
+			(candidate) => candidate.id !== task.id && this.isDescendant(task.id, candidate.id),
+		);
+		return [
+			...(predecessor?.attempts.flatMap((attempt) => (attempt.handoff ? [attempt.handoff] : [])) ?? []),
+			...task.attempts.flatMap((attempt) => (attempt.handoff ? [attempt.handoff] : [])),
+			...descendants.flatMap((descendant) =>
+				descendant.attempts.flatMap((attempt) => (attempt.handoff ? [attempt.handoff] : [])),
+			),
+		].slice(-AGENT_TASK_CONTEXT_HANDOFF_MAX_ITEMS);
 	}
 
 	private findTask(taskId: string): AgentTask {
@@ -1556,13 +1907,22 @@ export class AgentTaskGraph {
 			});
 		}
 	}
+
+	private assertSharedBudgetAvailable(): void {
+		const budget = this.getSharedBudget();
+		if (budget?.exhausted) {
+			throw new AgentTaskGraphError(
+				`task graph shared token budget is exhausted (${budget.usedTokens}/${budget.maxTotalTokens})`,
+			);
+		}
+	}
 }
 
 export function formatAgentTaskContextEnvelope(envelope: AgentTaskContextEnvelope): string {
 	return [
 		"[task contract]",
-		"You own this bounded task. Delegate only by transferring a genuinely narrower subset of its responsibility.",
-		"Return compact conclusions and evidence references. Report missing context through the task API instead of broadly rediscovering it.",
+		"You own this bounded task. Record a leaf-or-coordinator plan before exploration. Coordinators delegate genuinely narrower disjoint responsibility; leaves work directly.",
+		"Reuse predecessor handoffs and shared evidence instead of rediscovering them. Persist a compact handoff containing all useful findings and remaining claims before yielding control.",
 		JSON.stringify(envelope, null, 2),
 	].join("\n\n");
 }
@@ -1625,6 +1985,11 @@ function normalizeDelegationInput(input: AgentTaskDelegationInput): AgentTaskDel
 		),
 		...(input.resultSchema ? { resultSchema: normalizeRecord(input.resultSchema, "task.resultSchema") } : {}),
 		delegationReason: normalizeText(input.delegationReason, "task.delegationReason"),
+		...(input.contractKey ? { contractKey: normalizeIdentifier(input.contractKey, "task.contractKey") } : {}),
+		...(input.predecessorTaskId
+			? { predecessorTaskId: normalizeIdentifier(input.predecessorTaskId, "task.predecessorTaskId") }
+			: {}),
+		...(input.repeatReason ? { repeatReason: normalizeRepeatReason(input.repeatReason) } : {}),
 	};
 }
 
@@ -1706,6 +2071,9 @@ function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined)
 	}
 	assertExactObjectKeys(policy, "task graph policy", [
 		"requireExclusiveClaims",
+		"requireDelegatedTaskPlan",
+		"requireDelegationContractKey",
+		"maxTotalTokens",
 		"validateDelegation",
 		"validateCompletion",
 		"delegatedTaskConvergence",
@@ -1714,6 +2082,17 @@ function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined)
 	]);
 	if (policy.requireExclusiveClaims !== undefined && typeof policy.requireExclusiveClaims !== "boolean") {
 		throw new AgentTaskGraphError("requireExclusiveClaims must be a boolean");
+	}
+	for (const field of ["requireDelegatedTaskPlan", "requireDelegationContractKey"] as const) {
+		if (policy[field] !== undefined && typeof policy[field] !== "boolean") {
+			throw new AgentTaskGraphError(`${field} must be a boolean`);
+		}
+	}
+	if (
+		policy.maxTotalTokens !== undefined &&
+		(!Number.isSafeInteger(policy.maxTotalTokens) || policy.maxTotalTokens < 1)
+	) {
+		throw new AgentTaskGraphError("maxTotalTokens must be a positive integer");
 	}
 	for (const field of ["validateDelegation", "validateCompletion"] as const) {
 		if (policy[field] !== undefined && typeof policy[field] !== "function") {
@@ -1730,15 +2109,17 @@ function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined)
 			"maxToolCallsAfterSteer",
 			"maxExplorationToolCalls",
 		]);
-		for (const field of [
-			"maxToolCallsWithoutEvidence",
-			"maxToolCallsAfterSteer",
-			"maxExplorationToolCalls",
-		] as const) {
+		for (const field of ["maxToolCallsWithoutEvidence", "maxToolCallsAfterSteer"] as const) {
 			const value = convergence[field];
 			if (!Number.isSafeInteger(value) || value < 1) {
 				throw new AgentTaskGraphError(`delegatedTaskConvergence.${field} must be a positive integer`);
 			}
+		}
+		if (
+			convergence.maxExplorationToolCalls !== undefined &&
+			(!Number.isSafeInteger(convergence.maxExplorationToolCalls) || convergence.maxExplorationToolCalls < 1)
+		) {
+			throw new AgentTaskGraphError("delegatedTaskConvergence.maxExplorationToolCalls must be a positive integer");
 		}
 	}
 	if (
@@ -1836,8 +2217,21 @@ function addUsage(current: AgentTaskUsage, delta: AgentTaskUsage): AgentTaskUsag
 }
 
 function normalizeUsageAttributions(task: AgentTask): AgentTask {
+	const evidence = Array.isArray(task.evidence) ? task.evidence.map(normalizeStoredEvidence) : [];
+	const attempts =
+		Array.isArray(task.attempts) && task.attempts.length > 0
+			? task.attempts.map(normalizeStoredAttempt)
+			: [legacyAttempt(task, evidence)];
 	return {
 		...task,
+		...(task.contractKey ? { contractKey: normalizeIdentifier(task.contractKey, "task contractKey") } : {}),
+		...(task.predecessorTaskId
+			? { predecessorTaskId: normalizeIdentifier(task.predecessorTaskId, "task predecessorTaskId") }
+			: {}),
+		...(task.repeatReason ? { repeatReason: normalizeRepeatReason(task.repeatReason) } : {}),
+		evidence,
+		attempts,
+		...(task.plan ? { plan: normalizeStoredPlan(task.plan) } : {}),
 		...(task.convergence ? { convergence: normalizeConvergenceState(task.convergence) } : {}),
 		usageAttributions: Array.isArray(task.usageAttributions)
 			? task.usageAttributions.map((attribution) => ({
@@ -1934,6 +2328,333 @@ function mergeClaims(left: AgentTaskResourceClaim[], right: AgentTaskResourceCla
 	return merged;
 }
 
+function mergeStrings(left: string[], right: string[]): string[] {
+	return [...new Set([...left, ...right])];
+}
+
+function createAttempt(
+	agentId: string,
+	status: AgentTaskAttempt["status"],
+	predecessorAttemptId?: string,
+): AgentTaskAttempt {
+	const now = new Date().toISOString();
+	return {
+		id: `attempt-${randomUUID()}`,
+		agentId: normalizeIdentifier(agentId, "attempt.agentId"),
+		status,
+		...(predecessorAttemptId ? { predecessorAttemptId } : {}),
+		...(status === "running" ? { startedAt: now } : {}),
+	};
+}
+
+function currentAttempt(task: AgentTask): AgentTaskAttempt | undefined {
+	return task.attempts.at(-1);
+}
+
+function requireCurrentAttempt(task: AgentTask): AgentTaskAttempt {
+	const attempt = currentAttempt(task);
+	if (!attempt) throw new AgentTaskGraphError(`task ${task.id} has no current attempt`);
+	return attempt;
+}
+
+function updateCurrentAttempt(
+	task: AgentTask,
+	callerAgentId: string,
+	update: (attempt: AgentTaskAttempt) => AgentTaskAttempt,
+): AgentTaskAttempt[] {
+	const attempt = requireCurrentAttempt(task);
+	if (attempt.agentId !== callerAgentId) {
+		throw new AgentTaskGraphError(`agent ${callerAgentId} does not own current attempt ${attempt.id}`);
+	}
+	return [...task.attempts.slice(0, -1), update(attempt)];
+}
+
+function finishCurrentAttempt(
+	task: AgentTask,
+	callerAgentId: string,
+	status: "completed" | "interrupted" | "cancelled" | "replaced",
+	handoff: AgentTaskHandoff,
+): AgentTaskAttempt[] {
+	return updateCurrentAttempt(task, callerAgentId, (attempt) => ({
+		...attempt,
+		status,
+		startedAt: attempt.startedAt ?? attempt.endedAt ?? new Date().toISOString(),
+		endedAt: new Date().toISOString(),
+		handoff,
+	}));
+}
+
+function rebindActiveAttempt(task: AgentTask, newOwnerAgentId: string, reason: string): AgentTaskAttempt[] {
+	const current = requireCurrentAttempt(task);
+	if (current.agentId === newOwnerAgentId) return task.attempts;
+	const handoff = normalizeTaskHandoff(fallbackHandoff(task, reason), task);
+	return [
+		...finishCurrentAttempt(task, current.agentId, "replaced", handoff),
+		createAttempt(newOwnerAgentId, task.status === "running" ? "running" : "pending", current.id),
+	];
+}
+
+function normalizeTaskPlan(plan: Omit<AgentTaskPlan, "recordedAt">): Omit<AgentTaskPlan, "recordedAt"> {
+	if (!plan || typeof plan !== "object" || Array.isArray(plan)) {
+		throw new AgentTaskGraphError("task plan must be an object");
+	}
+	if (plan.mode !== "leaf" && plan.mode !== "coordinator") {
+		throw new AgentTaskGraphError("task plan mode must be leaf or coordinator");
+	}
+	return {
+		mode: plan.mode,
+		rationale: normalizeText(plan.rationale, "task plan rationale"),
+		boundaries: normalizeStringList(plan.boundaries ?? [], "task plan boundaries"),
+		expectedEvidence: normalizeStringList(plan.expectedEvidence ?? [], "task plan expectedEvidence"),
+	};
+}
+
+function normalizeStoredPlan(plan: AgentTaskPlan): AgentTaskPlan {
+	return {
+		...normalizeTaskPlan(plan),
+		recordedAt: normalizeTimestamp(plan.recordedAt, "task plan recordedAt"),
+	};
+}
+
+function normalizeTaskEvidenceInput(input: AgentTaskEvidenceInput): AgentTaskEvidenceInput {
+	if (!input || typeof input !== "object" || Array.isArray(input)) {
+		throw new AgentTaskGraphError("task evidence must be an object");
+	}
+	const digest = normalizeText(input.contentDigest, "task evidence contentDigest", 128).toLowerCase();
+	if (!/^[0-9a-f]{64}$/.test(digest)) {
+		throw new AgentTaskGraphError("task evidence contentDigest must be a lowercase SHA-256 digest");
+	}
+	return {
+		kind: normalizeIdentifier(input.kind, "task evidence kind"),
+		subjects: normalizeStringList(input.subjects, "task evidence subjects"),
+		...(input.claims ? { claims: normalizeClaims(input.claims, "task evidence claims") } : {}),
+		contentDigest: digest,
+		...(input.summary ? { summary: normalizeText(input.summary, "task evidence summary") } : {}),
+		...(input.artifactRef ? { artifactRef: normalizeText(input.artifactRef, "task evidence artifactRef") } : {}),
+	};
+}
+
+function normalizeStoredEvidence(evidence: AgentTaskEvidence): AgentTaskEvidence {
+	return {
+		...normalizeTaskEvidenceInput(evidence),
+		id: normalizeIdentifier(evidence.id, "task evidence id"),
+		producedByTaskId: normalizeIdentifier(evidence.producedByTaskId, "task evidence producedByTaskId"),
+		producedByAttemptId: normalizeIdentifier(evidence.producedByAttemptId, "task evidence producedByAttemptId"),
+		createdAt: normalizeTimestamp(evidence.createdAt, "task evidence createdAt"),
+	};
+}
+
+function evidenceIdentity(evidence: AgentTaskEvidenceInput): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify({
+				kind: evidence.kind,
+				subjects: [...evidence.subjects].sort(),
+				claims: [...(evidence.claims ?? [])].map(claimKey).sort(),
+				contentDigest: evidence.contentDigest,
+			}),
+		)
+		.digest("hex");
+}
+
+function normalizeTaskHandoff(input: AgentTaskHandoffInput, task: AgentTask): AgentTaskHandoff {
+	if (!input || typeof input !== "object" || Array.isArray(input)) {
+		throw new AgentTaskGraphError("task handoff must be an object");
+	}
+	const inspectedClaims = normalizeClaims(input.inspectedClaims ?? [], "task handoff inspectedClaims");
+	const remainingClaims = normalizeClaims(
+		input.remainingClaims ?? task.exclusiveClaims,
+		"task handoff remainingClaims",
+	);
+	for (const claim of [...inspectedClaims, ...remainingClaims]) {
+		if (!task.exclusiveClaims.some((owned) => sameClaim(owned, claim))) {
+			throw new AgentTaskGraphError(`task handoff claim ${claimKey(claim)} is not owned by task ${task.id}`);
+		}
+	}
+	const overlap = inspectedClaims.find((claim) => remainingClaims.some((remaining) => sameClaim(claim, remaining)));
+	if (overlap)
+		throw new AgentTaskGraphError(`task handoff claim appears inspected and remaining: ${claimKey(overlap)}`);
+	const evidenceIds = normalizeStringList(
+		input.evidenceIds ?? task.progress?.evidenceRefs ?? [],
+		"task handoff evidenceIds",
+	);
+	const handoff: AgentTaskHandoff = {
+		summary: normalizeText(input.summary, "task handoff summary"),
+		inspectedClaims,
+		remainingClaims,
+		evidenceIds,
+		candidateFindings: normalizeUnknownList(input.candidateFindings ?? [], "task handoff candidateFindings"),
+		rejectedHypotheses: normalizeStringList(input.rejectedHypotheses ?? [], "task handoff rejectedHypotheses"),
+		verification: normalizeUnknownList(input.verification ?? [], "task handoff verification"),
+		unresolvedQuestions: normalizeStringList(input.unresolvedQuestions ?? [], "task handoff unresolvedQuestions"),
+		recommendedNextScopes: normalizeStringList(
+			input.recommendedNextScopes ?? [],
+			"task handoff recommendedNextScopes",
+		),
+		createdAt: new Date().toISOString(),
+	};
+	assertJsonSize(handoff, "task handoff", AGENT_TASK_HANDOFF_MAX_BYTES);
+	return handoff;
+}
+
+function fallbackHandoff(task: AgentTask, reason: string): AgentTaskHandoffInput {
+	const drafted = currentAttempt(task)?.handoff;
+	if (drafted) {
+		return {
+			...drafted,
+			summary: boundedRuntimeText(`${reason}. ${drafted.summary}`, reason),
+			inspectedClaims: drafted.inspectedClaims.filter((claim) =>
+				task.exclusiveClaims.some((owned) => sameClaim(owned, claim)),
+			),
+			remainingClaims: drafted.remainingClaims.filter((claim) =>
+				task.exclusiveClaims.some((owned) => sameClaim(owned, claim)),
+			),
+		};
+	}
+	return {
+		summary: boundedRuntimeText(
+			task.progress?.summary ? `${reason}. Last durable progress: ${task.progress.summary}` : reason,
+			"Task ended before producing a model-authored handoff.",
+		),
+		remainingClaims: task.exclusiveClaims,
+		evidenceIds: task.progress?.evidenceRefs ?? [],
+		unresolvedQuestions: task.questions.filter(
+			(question) => !(task.progress?.completedQuestions ?? []).includes(question),
+		),
+	};
+}
+
+function handoffFromResult(task: AgentTask, result: AgentTaskResult): AgentTaskHandoff {
+	return normalizeTaskHandoff(
+		{
+			summary: result.summary,
+			inspectedClaims: task.exclusiveClaims,
+			remainingClaims: [],
+			evidenceIds: mergeStrings(task.progress?.evidenceRefs ?? [], result.evidenceRefs),
+			candidateFindings: result.candidateFindings,
+			verification: result.verification,
+			unresolvedQuestions: result.unresolvedQuestions,
+		},
+		task,
+	);
+}
+
+function handoffFromRejectedResult(task: AgentTask, result: AgentTaskResult): AgentTaskHandoff {
+	return normalizeTaskHandoff(
+		{
+			summary: result.summary,
+			remainingClaims: task.exclusiveClaims,
+			evidenceIds: mergeStrings(task.progress?.evidenceRefs ?? [], result.evidenceRefs),
+			candidateFindings: result.candidateFindings,
+			verification: result.verification,
+			unresolvedQuestions: result.unresolvedQuestions,
+		},
+		task,
+	);
+}
+
+function lastHandoff(task: AgentTask): AgentTaskHandoff | undefined {
+	return [...task.attempts].reverse().find((attempt) => attempt.handoff)?.handoff;
+}
+
+function normalizeStoredAttempt(attempt: AgentTaskAttempt): AgentTaskAttempt {
+	if (!["pending", "running", "completed", "interrupted", "cancelled", "replaced"].includes(attempt.status)) {
+		throw new AgentTaskGraphError(`unsupported task attempt status: ${String(attempt.status)}`);
+	}
+	const handoff = attempt.handoff ? normalizeStoredHandoff(attempt.handoff) : undefined;
+	return {
+		id: normalizeIdentifier(attempt.id, "task attempt id"),
+		agentId: normalizeIdentifier(attempt.agentId, "task attempt agentId"),
+		status: attempt.status,
+		...(attempt.predecessorAttemptId
+			? {
+					predecessorAttemptId: normalizeIdentifier(
+						attempt.predecessorAttemptId,
+						"task attempt predecessorAttemptId",
+					),
+				}
+			: {}),
+		...(attempt.startedAt ? { startedAt: normalizeTimestamp(attempt.startedAt, "task attempt startedAt") } : {}),
+		...(attempt.endedAt ? { endedAt: normalizeTimestamp(attempt.endedAt, "task attempt endedAt") } : {}),
+		...(handoff ? { handoff } : {}),
+	};
+}
+
+function normalizeStoredHandoff(handoff: AgentTaskHandoff): AgentTaskHandoff {
+	const normalized: AgentTaskHandoff = {
+		summary: normalizeText(handoff.summary, "task handoff summary"),
+		inspectedClaims: normalizeClaims(handoff.inspectedClaims, "task handoff inspectedClaims"),
+		remainingClaims: normalizeClaims(handoff.remainingClaims, "task handoff remainingClaims"),
+		evidenceIds: normalizeStringList(handoff.evidenceIds, "task handoff evidenceIds"),
+		candidateFindings: normalizeUnknownList(handoff.candidateFindings, "task handoff candidateFindings"),
+		rejectedHypotheses: normalizeStringList(handoff.rejectedHypotheses, "task handoff rejectedHypotheses"),
+		verification: normalizeUnknownList(handoff.verification, "task handoff verification"),
+		unresolvedQuestions: normalizeStringList(handoff.unresolvedQuestions, "task handoff unresolvedQuestions"),
+		recommendedNextScopes: normalizeStringList(handoff.recommendedNextScopes, "task handoff recommendedNextScopes"),
+		createdAt: normalizeTimestamp(handoff.createdAt, "task handoff createdAt"),
+	};
+	assertJsonSize(normalized, "task handoff", AGENT_TASK_HANDOFF_MAX_BYTES);
+	return normalized;
+}
+
+function legacyAttempt(task: AgentTask, evidence: AgentTaskEvidence[]): AgentTaskAttempt {
+	const status =
+		task.status === "completed"
+			? "completed"
+			: task.status === "interrupted"
+				? "interrupted"
+				: task.status === "cancelled"
+					? "cancelled"
+					: task.status === "running"
+						? "running"
+						: "pending";
+	const terminal = status === "completed" || status === "interrupted" || status === "cancelled";
+	const result = task.result;
+	const handoff = terminal
+		? {
+				summary: result?.summary ?? "Migrated legacy task attempt",
+				inspectedClaims: status === "completed" ? clone(task.exclusiveClaims) : [],
+				remainingClaims: status === "completed" ? [] : clone(task.exclusiveClaims),
+				evidenceIds: result?.evidenceRefs ?? evidence.map((item) => item.id),
+				candidateFindings: result?.candidateFindings ?? [],
+				rejectedHypotheses: [],
+				verification: result?.verification ?? [],
+				unresolvedQuestions: result?.unresolvedQuestions ?? [],
+				recommendedNextScopes: [],
+				createdAt: task.updatedAt,
+			}
+		: undefined;
+	return {
+		id: `attempt-legacy-${createHash("sha256").update(task.id).digest("hex").slice(0, 24)}`,
+		agentId: task.ownerAgentId,
+		status,
+		...(status === "running" || terminal ? { startedAt: task.createdAt } : {}),
+		...(terminal ? { endedAt: task.updatedAt } : {}),
+		...(handoff ? { handoff } : {}),
+	};
+}
+
+function normalizeTimestamp(value: string, field: string): string {
+	if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+		throw new AgentTaskGraphError(`${field} must be an ISO timestamp`);
+	}
+	return value;
+}
+
+function normalizeRepeatReason(
+	value: AgentTaskDelegationInput["repeatReason"],
+): NonNullable<AgentTaskDelegationInput["repeatReason"]> {
+	if (
+		value !== "remaining_scope" &&
+		value !== "recorded_gap" &&
+		value !== "contradiction" &&
+		value !== "new_cross_boundary_question"
+	) {
+		throw new AgentTaskGraphError(`unsupported task repeatReason: ${String(value)}`);
+	}
+	return value;
+}
+
 function delegationSignature(parentTaskId: string, task: AgentTaskDelegationInput): string {
 	return JSON.stringify({
 		parentTaskId,
@@ -1950,6 +2671,12 @@ function taskSignature(task: AgentTask): string {
 		exclusiveClaims: task.exclusiveClaims.map(claimKey).sort(),
 		questions: task.questions.map((question) => question.toLowerCase()).sort(),
 	});
+}
+
+function historicallyOverlaps(task: AgentTask, candidate: AgentTaskDelegationInput): boolean {
+	return task.exclusiveClaims.some((claim) =>
+		(candidate.exclusiveClaims ?? []).some((candidateClaim) => sameClaim(claim, candidateClaim)),
+	);
 }
 
 function compareTasks(left: AgentTask, right: AgentTask): number {

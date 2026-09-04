@@ -289,6 +289,8 @@ import {
 	type AgentTaskDelegationInput,
 	type AgentTaskGraph,
 	AgentTaskGraphError,
+	type AgentTaskHandoffInput,
+	type AgentTaskPlan,
 	type AgentTaskResult,
 	type AgentTaskResumeDispatch,
 	formatAgentTaskContextEnvelope,
@@ -1051,6 +1053,25 @@ function delegatedTaskConvergenceDirective(remainingToolCalls?: number): string 
 			? ""
 			: ` You have ${remainingToolCalls} remaining tool call${remainingToolCalls === 1 ? "" : "s"} in finalization.`;
 	return `You have reached this task's evidence-convergence boundary.${allowance} Stop broad exploration now. Record supported evidence with rlm.task.update, then submit the bounded structured conclusion. Report a precise gap if the task cannot be completed.`;
+}
+
+function runtimeFailureTaskHandoff(
+	graph: AgentTaskGraph,
+	taskId: string,
+	lastAssistantText: string | undefined,
+	reason: string,
+): AgentTaskHandoffInput | undefined {
+	const task = graph.getTask(taskId);
+	if (task.attempts.at(-1)?.handoff) return undefined;
+	const summary = compactRlmText(lastAssistantText ?? task.progress?.summary ?? reason);
+	return {
+		summary: summary.slice(0, 4_000) || reason,
+		remainingClaims: task.exclusiveClaims,
+		evidenceIds: task.progress?.evidenceRefs ?? [],
+		unresolvedQuestions: task.questions.filter(
+			(question) => !(task.progress?.completedQuestions ?? []).includes(question),
+		),
+	};
 }
 
 function noopRlmChildAbort(): void {}
@@ -9317,7 +9338,9 @@ export class AgentSession {
 				"rlm.task.snapshot",
 				"rlm.task.root_context",
 				"rlm.task.defer_until_children_complete",
+				"rlm.task.plan",
 				"rlm.task.update",
+				"rlm.task.handoff",
 				"rlm.task.complete",
 				"rlm.task.report_gap",
 				"rlm.task.resolve_gap",
@@ -9442,6 +9465,10 @@ export class AgentSession {
 				return { rootContext: graph.getRootContext() ?? null };
 			case "rlm.task.defer_until_children_complete":
 				return graph.deferUntilDescendantsComplete(taskId, callerAgentId);
+			case "rlm.task.plan": {
+				const plan = requiredRecord(payload.plan, "plan") as unknown as Omit<AgentTaskPlan, "recordedAt">;
+				return { task: graph.recordPlan(taskId, callerAgentId, plan) };
+			}
 			case "rlm.task.update":
 				return {
 					task: graph.updateProgress(taskId, callerAgentId, {
@@ -9450,6 +9477,10 @@ export class AgentSession {
 						completedQuestions: optionalStringArray(payload.completed_questions, "completed_questions"),
 					}),
 				};
+			case "rlm.task.handoff": {
+				const handoff = requiredRecord(payload.handoff, "handoff") as unknown as AgentTaskHandoffInput;
+				return { task: graph.recordHandoff(taskId, callerAgentId, handoff) };
+			}
 			case "rlm.task.complete": {
 				const task = this.runTaskCompletionCorrectionAction(taskId, () => {
 					const rawResult = requiredRecord(payload.result, "result") as unknown as AgentTaskResult;
@@ -9960,7 +9991,12 @@ export class AgentSession {
 				const callerAgentId = this._taskActorId ?? this._taskGraph.rootAgentId;
 				const task = this._taskGraph.getTask(run.taskId);
 				if (task.status !== "completed" && task.status !== "cancelled" && task.status !== "interrupted") {
-					this._taskGraph.cancelTask(run.taskId, callerAgentId, reason);
+					this._taskGraph.cancelTask(
+						run.taskId,
+						callerAgentId,
+						reason,
+						runtimeFailureTaskHandoff(this._taskGraph, run.taskId, run.session?.getLastAssistantText(), reason),
+					);
 				}
 			} catch (error) {
 				const taskError = error instanceof Error ? error.message : String(error);
@@ -10884,7 +10920,17 @@ export class AgentSession {
 										);
 									} else if (convergence?.exhausted && !run.error) {
 										run.error = `Delegated task ${delegatedTaskId} did not converge after its finalization boundary`;
-										this._taskGraph.interruptTask(delegatedTaskId, childNodeId, run.error);
+										this._taskGraph.interruptTask(
+											delegatedTaskId,
+											childNodeId,
+											run.error,
+											runtimeFailureTaskHandoff(
+												this._taskGraph,
+												delegatedTaskId,
+												child.getLastAssistantText(),
+												run.error,
+											),
+										);
 										child.requestAbort();
 									}
 								}
@@ -11082,7 +11128,17 @@ export class AgentSession {
 				if (delegatedTaskId && this._taskGraph) {
 					try {
 						if (this._taskGraph.getTask(delegatedTaskId).ownerAgentId === childNodeId) {
-							this._taskGraph.interruptTask(delegatedTaskId, childNodeId, runError.message);
+							this._taskGraph.interruptTask(
+								delegatedTaskId,
+								childNodeId,
+								runError.message,
+								runtimeFailureTaskHandoff(
+									this._taskGraph,
+									delegatedTaskId,
+									childSession?.getLastAssistantText(),
+									runError.message,
+								),
+							);
 						}
 						suppressTerminalMessage = this._hasPendingCoalescedDelegatedCompletionWait();
 					} catch (taskError) {

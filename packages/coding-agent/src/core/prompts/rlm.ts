@@ -58,7 +58,7 @@ export function buildChildAgentDoctrine(options: ChildAgentDoctrineOptions): str
 	}
 	if (options.coordinatedTasks && hasIpython) {
 		lines.push(
-			"Your complete owned assignment is available through `await rlm.task.current()`. Report bounded progress, evidence references, and context gaps through `rlm.task`; complete the task with a structured result before going idle.",
+			"Your complete owned assignment is available through `await rlm.task.current()`. Before broad exploration, record whether you are a leaf or coordinator with `await rlm.task.plan(...)`. Persist reusable findings with `await rlm.task.handoff(...)`; complete the task with a structured result before going idle.",
 		);
 	}
 	return lines.join("\n");
@@ -140,8 +140,9 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		if (options.coordinatedTasks) {
 			parts.push(
 				"This run has a durable task graph. Inspect it with `await rlm.task.current()` and `await rlm.task.snapshot()`; snapshots include generic supervision alerts for blocked, stalled, uncertain, or synthesis-ready tasks.",
-				"Delegate coordinated work with `await rlm.delegate(prompt, task={...})`. The task must be genuinely narrower, transfer exclusive claims you own, include explicit scope and exclusions, and include enough context to avoid repository-wide rediscovery.",
-				"After transfer, coordinate that scope instead of repeating it. Children may recursively delegate under the same ownership rule. Direct parents supervise their children and the root can supervise the whole tree. Report missing context with `await rlm.task.report_gap(...)`, persist progress with `await rlm.task.update(...)`, and finish with `await rlm.task.complete(result)`.",
+				"Delegate coordinated work with `await rlm.delegate(prompt, task={...})`. The task must be genuinely narrower, transfer exclusive claims you own, include a stable behavioral contractKey, explicit scope and exclusions, and enough context to avoid repository-wide rediscovery.",
+				"Every delegated owner must first call `await rlm.task.plan(...)` as either a leaf or coordinator. Coordinators recursively transfer disjoint narrower scopes; leaves investigate directly. After transfer, coordinate instead of repeating child exploration. Before yielding or when useful findings accumulate, persist a compact `await rlm.task.handoff(...)`; Prime also synthesizes a fallback handoff on runtime failure.",
+				"Successor tasks must reference the latest terminal predecessorTaskId and a concrete repeatReason, and may own only claims the predecessor handoff marked remaining. Contract keys are behavioral labels, not permission to repeat historical claim coverage. Only host-recorded evidence advances convergence; task.update references are notes, not proof. Report missing context with `await rlm.task.report_gap(...)`, persist progress with `await rlm.task.update(...)`, and finish with `await rlm.task.complete(result)`.",
 				"When delegated descendants are still active, call `await rlm.task.defer_until_children_complete()` once and end the turn. Prime durably suspends the coordinator and resumes it with one synthesis turn after the whole descendant subtree is terminal; never poll, sleep, or repeatedly inspect task status.",
 			);
 		}

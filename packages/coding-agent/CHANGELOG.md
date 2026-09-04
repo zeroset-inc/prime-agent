@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added durable leaf-or-coordinator task plans, attempt handoffs, trusted shared-evidence deduplication, a graph-wide token budget, and graph-wide predecessor-aware exclusive-claim coverage.
+- Changed graph-scoped delegated-task convergence to use an evidence-stagnation guard with an optional emergency exploration ceiling that survives task reassignment and recovery.
 - Fixed failed or cancelled recursive child runs causing headless sessions to hang indefinitely.
 - Fixed GitHub beta releases missing the immutable package artifacts required for installation.
 

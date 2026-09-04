@@ -1116,6 +1116,10 @@ describe("AgentSession rlm recursion", () => {
 			"summary must be rewritten",
 			"summary must be rewritten",
 		]);
+		expect(graph.getTask(spawned.task_id!).attempts.at(-1)?.handoff).toMatchObject({
+			summary: expect.stringContaining("immutable conclusion"),
+			remainingClaims: [{ namespace: "repo:file", key: "runtime.ts" }],
+		});
 	});
 
 	it("retains both automatic-completion and correction failures in the child failure cause", async () => {
@@ -1442,9 +1446,11 @@ describe("AgentSession rlm recursion", () => {
 			execute: async (_toolCallId: string, params: { query: string }) => {
 				toolSequence += 1;
 				const task = graph.getTask(delegatedTaskId);
-				graph.updateProgress(delegatedTaskId, task.ownerAgentId, {
+				graph.recordEvidence(delegatedTaskId, task.ownerAgentId, {
+					kind: "repository-read",
+					subjects: ["runtime.ts"],
+					contentDigest: String(toolSequence).repeat(64),
 					summary: `Evidence ${toolSequence}`,
-					evidenceRefs: [`artifact://runtime-${toolSequence}`],
 				});
 				return { content: [{ type: "text" as const, text: params.query }], details: {} };
 			},

@@ -218,6 +218,23 @@ class _RLMTaskAPI:
         """
         return await host_request("rlm.task.defer_until_children_complete")
 
+    async def plan(
+        self,
+        mode: str,
+        rationale: str,
+        *,
+        boundaries: list[str] | None = None,
+        expected_evidence: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Choose leaf execution or recursive coordination before exploration."""
+        plan: dict[str, Any] = {
+            "mode": mode,
+            "rationale": rationale,
+            "boundaries": boundaries or [],
+            "expectedEvidence": expected_evidence or [],
+        }
+        return await host_request("rlm.task.plan", {"plan": plan})
+
     async def update(
         self,
         summary: str,
@@ -232,6 +249,12 @@ class _RLMTaskAPI:
         if completed_questions is not None:
             payload["completed_questions"] = completed_questions
         return await host_request("rlm.task.update", payload)
+
+    async def handoff(self, handoff: dict[str, Any]) -> dict[str, Any]:
+        """Persist reusable findings and remaining work before yielding control."""
+        if not isinstance(handoff, dict):
+            raise TypeError(f"handoff must be dict, got {type(handoff).__name__}")
+        return await host_request("rlm.task.handoff", {"handoff": handoff})
 
     async def complete(self, result: dict[str, Any]) -> dict[str, Any]:
         """Complete the current task with a bounded structured result."""
