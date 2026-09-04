@@ -7394,11 +7394,13 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
-	requestAbort(): void {
+	requestAbort(options: { cancelQuiescenceWaits?: boolean } = {}): void {
 		for (const run of [...this._unsettledRlmChildRuns]) {
 			if (run.status === "cancelled") this._abandonRlmRunForQuiescence(run);
 		}
-		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
+		if (options.cancelQuiescenceWaits !== false) {
+			for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
+		}
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
@@ -9978,7 +9980,9 @@ export class AgentSession {
 			completeTaskCompletionCorrectionAction(correction);
 			return result;
 		} catch (error) {
-			if (recordTaskCompletionCorrectionFailure(correction, error)) this.requestAbort();
+			if (recordTaskCompletionCorrectionFailure(correction, error)) {
+				this.requestAbort({ cancelQuiescenceWaits: false });
+			}
 			throw error;
 		}
 	}
@@ -11424,15 +11428,11 @@ export class AgentSession {
 										childNodeId,
 										toolCallsSinceConvergenceBoundary,
 									);
-									if (convergence?.enteredFinalizing) {
-										const directive = delegatedTaskConvergenceDirective(
-											convergence.remainingFinalizationToolCalls,
-										);
-										child.agent.steer(
-											createAgentTaskControlMessage(delegatedTaskId, "convergence", directive),
-										);
-									} else if (convergence?.exhausted && !run.error) {
-										run.error = `Delegated task ${delegatedTaskId} did not converge after its finalization boundary`;
+									if (convergence?.exhausted && !run.error) {
+										run.error =
+											convergence.reason === "shared_budget"
+												? `Delegated task ${delegatedTaskId} stopped because the shared task token budget was exhausted`
+												: `Delegated task ${delegatedTaskId} did not converge after its finalization boundary`;
 										this._taskGraph.interruptTask(
 											delegatedTaskId,
 											childNodeId,
@@ -11444,13 +11444,20 @@ export class AgentSession {
 												run.error,
 											),
 										);
-										child.requestAbort();
+										child.requestAbort({ cancelQuiescenceWaits: false });
+									} else if (convergence?.enteredFinalizing) {
+										const directive = delegatedTaskConvergenceDirective(
+											convergence.remainingFinalizationToolCalls,
+										);
+										child.agent.steer(
+											createAgentTaskControlMessage(delegatedTaskId, "convergence", directive),
+										);
 									}
 								}
 							}
 						} catch (error) {
 							run.error = error instanceof Error ? error.message : String(error);
-							child.requestAbort();
+							child.requestAbort({ cancelQuiescenceWaits: false });
 						} finally {
 							toolCallsSinceConvergenceBoundary = 0;
 						}

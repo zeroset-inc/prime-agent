@@ -1,7 +1,7 @@
 import { writeFileSync } from "fs";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, it } from "vitest";
-import { getModel } from "../src/models.js";
+import { getModel, getModels } from "../src/models.js";
 import { completeSimple, getEnvApiKey } from "../src/stream.js";
 import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage } from "../src/types.js";
 import { hasAzureOpenAICredentials } from "./azure-utils.js";
@@ -27,6 +27,10 @@ interface ProviderModelPair {
 	upstreamApiKeyEnv?: string;
 }
 
+function getCloudflareGatewayModel(api: Api): string {
+	return getModels("cloudflare-ai-gateway").find((model) => model.api === api)?.id ?? `missing-${api}`;
+}
+
 const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "anthropic", model: "claude-sonnet-4-5", label: "anthropic-claude-sonnet-4-5" },
 	{ provider: "google", model: "gemini-3-flash-preview", label: "google-gemini-3-flash-preview" },
@@ -40,8 +44,8 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "azure-openai-responses", model: "gpt-4o-mini", label: "azure-openai-responses-gpt-4o-mini" },
 	{ provider: "openai-codex", model: "gpt-5.2-codex", label: "openai-codex-gpt-5.2-codex" },
 	{ provider: "prime-inference", model: "openai/gpt-5.5", label: "prime-inference-gpt-5.5" },
-	{ provider: "github-copilot", model: "claude-sonnet-4.5", label: "copilot-claude-sonnet-4.5" },
-	{ provider: "github-copilot", model: "gpt-5.2-codex", label: "copilot-gpt-5.2-codex" },
+	{ provider: "github-copilot", model: "claude-sonnet-4.6", label: "copilot-claude-sonnet-4.6" },
+	{ provider: "github-copilot", model: "gpt-5.3-codex", label: "copilot-gpt-5.3-codex" },
 	{ provider: "github-copilot", model: "gemini-3.5-flash", label: "copilot-gemini-3.5-flash" },
 	{ provider: "github-copilot", model: "grok-4.5", label: "copilot-grok-4.5" },
 	{
@@ -54,14 +58,14 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "cloudflare-workers-ai", model: "@cf/moonshotai/kimi-k2.6", label: "cloudflare-kimi-k2.6" },
 	{
 		provider: "cloudflare-ai-gateway",
-		model: "claude-sonnet-4-5",
-		label: "cloudflare-gateway-claude-sonnet-4-5",
+		model: getCloudflareGatewayModel("anthropic-messages"),
+		label: "cloudflare-gateway-anthropic",
 		upstreamApiKeyEnv: "ANTHROPIC_API_KEY",
 	},
 	{
 		provider: "cloudflare-ai-gateway",
-		model: "gpt-5.1",
-		label: "cloudflare-gateway-gpt-5.1",
+		model: getCloudflareGatewayModel("openai-responses"),
+		label: "cloudflare-gateway-openai",
 		upstreamApiKeyEnv: "OPENAI_API_KEY",
 	},
 	{ provider: "groq", model: "openai/gpt-oss-120b", label: "groq-gpt-oss-120b" },

@@ -1623,6 +1623,33 @@ describe("AgentSession rlm recursion", () => {
 		await bash;
 	});
 
+	it("keeps a parent quiescence barrier alive for an internally stopped child", async () => {
+		const child = createSession({ rlmSessionDir: join(tempDir, "internally-stopped-child") });
+		const bashStarted = deferred<void>();
+		const bashCompletion = deferred<void>();
+		const bash = child.executeBash("internal-stop-gate", undefined, {
+			operations: {
+				exec: async () => {
+					bashStarted.resolve();
+					await bashCompletion.promise;
+					return { exitCode: 0 };
+				},
+			},
+		});
+		await bashStarted.promise;
+		const root = createSession();
+		expect(root.registerRlmChildSession("internally-stopped-child", child)).toBe(true);
+
+		const quiescence = root.waitForRlmQuiescence();
+		await vi.waitFor(() => expect((child as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1));
+		child.requestAbort({ cancelQuiescenceWaits: false });
+		expect((child as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1);
+
+		bashCompletion.resolve();
+		await bash;
+		await expect(quiescence).resolves.toBeUndefined();
+	});
+
 	it("cancels sibling recursive waiters when one child quiescence wait fails", async () => {
 		const childAStarted = deferred<void>();
 		const childACompletion = deferred<void>();
