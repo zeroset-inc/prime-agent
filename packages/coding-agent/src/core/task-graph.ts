@@ -762,8 +762,28 @@ export class AgentTaskGraph {
 		if (this.policy.requireExclusiveClaims && exclusiveClaims.length === 0) {
 			throw new AgentTaskGraphError("delegated task must transfer at least one exclusive claim");
 		}
+		const predecessor = normalized.predecessorTaskId ? this.findTask(normalized.predecessorTaskId) : undefined;
+		let predecessorHandoff: AgentTaskHandoff | undefined;
+		if (predecessor) {
+			if (ACTIVE_TASK_STATUSES.has(predecessor.status)) {
+				throw new AgentTaskGraphError("predecessorTaskId must identify a terminal task in this graph");
+			}
+			if (!normalized.repeatReason) {
+				throw new AgentTaskGraphError("a successor delegation must include repeatReason");
+			}
+			if (!this.isDescendant(parent.id, predecessor.id)) {
+				throw new AgentTaskGraphError(`predecessor task ${predecessor.id} is outside parent task ${parent.id}`);
+			}
+			predecessorHandoff = lastHandoff(predecessor);
+			if (!predecessorHandoff) {
+				throw new AgentTaskGraphError(`predecessor task ${predecessor.id} has no durable handoff`);
+			}
+		}
 		for (const claim of exclusiveClaims) {
-			if (!parent.exclusiveClaims.some((candidate) => sameClaim(candidate, claim))) {
+			const parentOwnsClaim = parent.exclusiveClaims.some((candidate) => sameClaim(candidate, claim));
+			const predecessorOwnsClaim =
+				predecessor?.exclusiveClaims.some((candidate) => sameClaim(candidate, claim)) ?? false;
+			if (!parentOwnsClaim && !predecessorOwnsClaim) {
 				throw new AgentTaskGraphError(`parent task does not own exclusive claim ${claimKey(claim)}`);
 			}
 		}
@@ -804,27 +824,27 @@ export class AgentTaskGraph {
 		const historicalDuplicate = this.state.tasks
 			.filter((task) => !ACTIVE_TASK_STATUSES.has(task.status) && historicallyOverlaps(task, normalized))
 			.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id))[0];
-		if (historicalDuplicate && normalized.predecessorTaskId !== historicalDuplicate.id) {
+		if (historicalDuplicate && predecessor?.id !== historicalDuplicate.id) {
 			throw new AgentTaskGraphError(
 				`exclusive claim coverage was already attempted by ${historicalDuplicate.id}; link the latest attempt as predecessorTaskId and name a repeatReason`,
 			);
 		}
-		if (normalized.predecessorTaskId) {
-			const predecessor = this.findTask(normalized.predecessorTaskId);
-			if (ACTIVE_TASK_STATUSES.has(predecessor.status)) {
-				throw new AgentTaskGraphError("predecessorTaskId must identify a terminal task in this graph");
-			}
-			if (!normalized.repeatReason) {
-				throw new AgentTaskGraphError("a successor delegation must include repeatReason");
-			}
-			const handoff = lastHandoff(predecessor);
-			if (!handoff) throw new AgentTaskGraphError(`predecessor task ${predecessor.id} has no durable handoff`);
+		if (predecessor && predecessorHandoff) {
+			const permittedClaims = successorClaimPool(predecessor, predecessorHandoff, normalized.repeatReason!);
 			for (const claim of exclusiveClaims) {
-				if (!handoff.remainingClaims.some((remaining) => sameClaim(remaining, claim))) {
+				if (!permittedClaims.some((permitted) => sameClaim(permitted, claim))) {
 					throw new AgentTaskGraphError(
-						`successor claim ${claimKey(claim)} was not left remaining by ${predecessor.id}`,
+						`successor claim ${claimKey(claim)} is not permitted by ${normalized.repeatReason} from ${predecessor.id}`,
 					);
 				}
+			}
+			if (
+				normalized.repeatReason === "new_cross_boundary_question" &&
+				!hasNovelQuestion(predecessor.questions, normalized.questions)
+			) {
+				throw new AgentTaskGraphError(
+					`new_cross_boundary_question successor must add a review question not already covered by ${predecessor.id}`,
+				);
 			}
 		}
 		this.policy.validateDelegation?.({
@@ -2677,6 +2697,26 @@ function historicallyOverlaps(task: AgentTask, candidate: AgentTaskDelegationInp
 	return task.exclusiveClaims.some((claim) =>
 		(candidate.exclusiveClaims ?? []).some((candidateClaim) => sameClaim(claim, candidateClaim)),
 	);
+}
+
+function successorClaimPool(
+	predecessor: AgentTask,
+	handoff: AgentTaskHandoff,
+	repeatReason: NonNullable<AgentTaskDelegationInput["repeatReason"]>,
+): AgentTaskResourceClaim[] {
+	if (repeatReason === "remaining_scope" || repeatReason === "recorded_gap") {
+		return handoff.remainingClaims;
+	}
+	return predecessor.exclusiveClaims;
+}
+
+function hasNovelQuestion(previous: string[], candidate: string[]): boolean {
+	const covered = new Set(previous.map(normalizeCoverageQuestion));
+	return candidate.some((question) => !covered.has(normalizeCoverageQuestion(question)));
+}
+
+function normalizeCoverageQuestion(question: string): string {
+	return question.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function compareTasks(left: AgentTask, right: AgentTask): number {

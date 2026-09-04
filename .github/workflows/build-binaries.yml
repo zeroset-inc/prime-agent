@@ -247,6 +247,11 @@ jobs:
           ref: ${{ env.BUILD_REF }}
           persist-credentials: false
 
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
       - name: Download production artifacts
         if: env.PUBLISH_PRODUCTION == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -288,7 +293,7 @@ jobs:
           fi
 
       - name: Publish production channel to R2
-        if: env.PUBLISH_PRODUCTION == 'true'
+        if: env.PUBLISH_PRODUCTION == 'true' && env.R2_BUCKET != '' && env.R2_ENDPOINT_URL != ''
         run: |
           PRODUCTION_DIR=release-artifacts/production
           RELEASE_PREFIX="releases/v${PRODUCTION_VERSION}"
@@ -356,7 +361,7 @@ jobs:
           fi
 
       - name: Publish immutable beta artifacts to R2
-        if: env.PUBLISH_BETA == 'true'
+        if: env.PUBLISH_BETA == 'true' && env.R2_BUCKET != '' && env.R2_ENDPOINT_URL != ''
         run: |
           BETA_DIR=release-artifacts/beta
           RELEASE_PREFIX="releases/v${BETA_VERSION}"
@@ -381,6 +386,41 @@ jobs:
             --content-type text/plain \
             --cache-control 'public, max-age=31536000, immutable'
 
+      - name: Publish and verify immutable beta GitHub release
+        if: env.PUBLISH_BETA == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BETA_DIR=release-artifacts/beta
+          RELEASE_TAG="v${BETA_VERSION}"
+          TARBALL="$BETA_DIR/prime-agent-${BETA_VERSION}.tgz"
+          INSTALL_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/$(basename "$TARBALL")"
+
+          test -f "$TARBALL"
+          test -f "$BETA_DIR/SHA256SUMS"
+          (cd "$BETA_DIR" && sha256sum --check SHA256SUMS)
+          printf "Immutable beta artifacts for \`%s\` (\`%s\`).\n" "$RELEASE_TAG" "$BUILD_REF" > /tmp/immutable-beta-release-notes.md
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$BETA_DIR"/* --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --target "$BUILD_REF" \
+              --notes-file /tmp/immutable-beta-release-notes.md \
+              --prerelease \
+              "$BETA_DIR"/*
+          fi
+
+          smoke_dir=$(mktemp -d)
+          cleanup_smoke_dir() {
+            rm -rf "$smoke_dir"
+          }
+          trap cleanup_smoke_dir EXIT
+          npm install --prefix "$smoke_dir" --ignore-scripts --no-audit --no-fund "$INSTALL_URL"
+          installed_version=$("$smoke_dir/node_modules/.bin/prime-agent" --version 2>&1)
+          test "$installed_version" = "$BETA_VERSION"
+
       - name: Advance beta release
         if: env.PUBLISH_BETA == 'true'
         env:
@@ -394,25 +434,29 @@ jobs:
           fi
 
           BETA_DIR=release-artifacts/beta
-          aws s3 cp "$BETA_DIR/beta.json" "s3://${R2_BUCKET}/beta.json" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type application/json \
-            --cache-control no-cache
+          if [ -n "$R2_BUCKET" ] && [ -n "$R2_ENDPOINT_URL" ]; then
+            aws s3 cp "$BETA_DIR/beta.json" "s3://${R2_BUCKET}/beta.json" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              --content-type application/json \
+              --cache-control no-cache
 
-          aws s3 cp "$BETA_DIR/beta" "s3://${R2_BUCKET}/beta" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/plain \
-            --cache-control no-cache
+            aws s3 cp "$BETA_DIR/beta" "s3://${R2_BUCKET}/beta" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              --content-type text/plain \
+              --cache-control no-cache
 
-          aws s3 cp /tmp/prime-agent-install.sh "s3://${R2_BUCKET}/install.sh" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/x-shellscript \
-            --cache-control no-cache
+            aws s3 cp /tmp/prime-agent-install.sh "s3://${R2_BUCKET}/install.sh" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              --content-type text/x-shellscript \
+              --cache-control no-cache
 
-          aws s3 cp /tmp/prime-agent-install-beta.sh "s3://${R2_BUCKET}/install-beta.sh" \
-            --endpoint-url "$R2_ENDPOINT_URL" \
-            --content-type text/x-shellscript \
-            --cache-control no-cache
+            aws s3 cp /tmp/prime-agent-install-beta.sh "s3://${R2_BUCKET}/install-beta.sh" \
+              --endpoint-url "$R2_ENDPOINT_URL" \
+              --content-type text/x-shellscript \
+              --cache-control no-cache
+          else
+            echo "R2 is not configured; advancing only the GitHub beta channel."
+          fi
 
           printf 'Automated beta build from `%s` (`%s`).\n' "$DEFAULT_BRANCH" "$BUILD_REF" > /tmp/beta-release-notes.md
 

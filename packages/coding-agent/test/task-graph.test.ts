@@ -1299,6 +1299,74 @@ describe("AgentTaskGraph", () => {
 		);
 	});
 
+	it("permits provenance-linked revisits only for a contradiction or a genuinely new question", () => {
+		const graph = open();
+		const completed = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "first-agent",
+			task: {
+				objective: "Review a.ts",
+				scope: "a.ts behavior",
+				exclusiveClaims: [claim("a.ts")],
+				questions: ["Does the parser preserve empty values?"],
+				delegationReason: "Independent parser contract",
+			},
+		});
+		graph.startTask(completed.id, "first-agent");
+		graph.completeTaskFromRuntime(completed.id, "first-agent", "The parser preserves empty values");
+
+		expect(() =>
+			graph.reserveDelegation({
+				parentTaskId: graph.rootTaskId,
+				callerAgentId: "root-agent",
+				childAgentId: "invalid-agent",
+				task: {
+					objective: "Repeat the parser review",
+					scope: "a.ts behavior",
+					exclusiveClaims: [claim("a.ts")],
+					questions: ["Does the parser preserve empty values?"],
+					delegationReason: "Repeat the same review",
+					predecessorTaskId: completed.id,
+					repeatReason: "remaining_scope",
+				},
+			}),
+		).toThrow("is not permitted by remaining_scope");
+
+		expect(() =>
+			graph.reserveDelegation({
+				parentTaskId: graph.rootTaskId,
+				callerAgentId: "root-agent",
+				childAgentId: "renamed-question-agent",
+				task: {
+					objective: "Check a cross-boundary parser interaction",
+					scope: "a.ts interaction",
+					exclusiveClaims: [claim("a.ts")],
+					questions: ["  DOES   THE PARSER preserve EMPTY values? "],
+					delegationReason: "A caller exposed a new boundary",
+					predecessorTaskId: completed.id,
+					repeatReason: "new_cross_boundary_question",
+				},
+			}),
+		).toThrow("must add a review question");
+
+		const successor = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root-agent",
+			childAgentId: "cross-boundary-agent",
+			task: {
+				objective: "Check a cross-boundary parser interaction",
+				scope: "a.ts interaction with caller.ts",
+				exclusiveClaims: [claim("a.ts")],
+				questions: ["Can caller.ts distinguish an empty value from an absent value?"],
+				delegationReason: "A caller exposed a new behavioral boundary",
+				predecessorTaskId: completed.id,
+				repeatReason: "new_cross_boundary_question",
+			},
+		});
+		expect(graph.contextEnvelope(successor.id).relevantHandoffs).not.toHaveLength(0);
+	});
+
 	it("treats novel trusted evidence as convergence progress without requiring task.update", () => {
 		directory = mkdtempSync(join(tmpdir(), "prime-task-evidence-convergence-"));
 		const graph = AgentTaskGraph.open({

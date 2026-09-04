@@ -318,5 +318,11 @@ describe("builtin skills", () => {
 			const script = readFileSync(join(repoRoot, "scripts", "pack-prime-agent-release.mjs"), "utf-8");
 			expect(script).toContain('"skills"');
 		});
+
+		it("release packer rejects version overrides that drift from source metadata", () => {
+			const script = readFileSync(join(repoRoot, "scripts", "pack-prime-agent-release.mjs"), "utf-8");
+			expect(script).toContain("Release package versions must match workspace version");
+			expect(script).toContain("must match source package version");
+		});
 	});
 });
