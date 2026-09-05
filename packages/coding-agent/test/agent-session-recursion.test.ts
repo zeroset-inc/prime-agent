@@ -127,6 +127,7 @@ interface InspectableRlmSession {
 	_rlmChildUnsubscribes: Map<string, () => void>;
 	_deletedRlmChildIds: Set<string>;
 	_rlmQuiescenceWaitAborts: Set<AbortController>;
+	_waitForRlmQuiescence(signal: AbortSignal | undefined, owner: AgentSession): Promise<void>;
 	_createKernelHostHandlers(): HostRequestHandlers;
 	_dispatchTaskResume(request: AgentTaskResumeDispatch): Promise<"admitted" | "owner_unavailable">;
 	_drainPendingTaskResumes(): Promise<void>;
@@ -1662,12 +1663,13 @@ describe("AgentSession rlm recursion", () => {
 		const parentBashCompletion = deferred<void>();
 		const root = createSession();
 		expect(root.registerRlmChildSession("boundary-active-child", child)).toBe(true);
-		const originalChildQuiescence = child.waitForRlmQuiescence.bind(child);
+		const inspectableChild = child as unknown as InspectableRlmSession;
+		const originalChildQuiescence = inspectableChild._waitForRlmQuiescence.bind(child);
 		const childWaitStarted = deferred<void>();
 		let parentBash: Promise<unknown> | undefined;
-		vi.spyOn(child, "waitForRlmQuiescence").mockImplementation(async (signal) => {
+		vi.spyOn(inspectableChild, "_waitForRlmQuiescence").mockImplementation(async (signal, owner) => {
 			childWaitStarted.resolve();
-			await originalChildQuiescence(signal);
+			await originalChildQuiescence(signal, owner);
 			parentBash = root.executeBash("parent-boundary-gate", undefined, {
 				operations: {
 					exec: async () => {
@@ -1720,7 +1722,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(root.registerRlmChildSession("cancelled-bash-active-child", child)).toBe(true);
 
 		const quiescence = root.waitForRlmQuiescence();
-		await vi.waitFor(() => expect((child as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1));
+		await vi.waitFor(() => expect((root as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(2));
 		root.requestAbort();
 		await expect(quiescence).rejects.toThrow("RLM quiescence wait cancelled");
 		expect(child.isBashRunning).toBe(true);
@@ -1748,9 +1750,9 @@ describe("AgentSession rlm recursion", () => {
 		expect(root.registerRlmChildSession("internally-stopped-child", child)).toBe(true);
 
 		const quiescence = root.waitForRlmQuiescence();
-		await vi.waitFor(() => expect((child as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1));
+		await vi.waitFor(() => expect((root as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(2));
 		child.requestAbort({ cancelQuiescenceWaits: false });
-		expect((child as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1);
+		expect((root as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(2);
 
 		bashCompletion.resolve();
 		await bash;
@@ -1786,14 +1788,17 @@ describe("AgentSession rlm recursion", () => {
 		const root = createSession();
 		expect(root.registerRlmChildSession("failing-wait-child", childA)).toBe(true);
 		expect(root.registerRlmChildSession("sibling-wait-child", childB)).toBe(true);
+		vi.spyOn(childA, "waitForHeadlessIdle").mockImplementation(async () => {
+			await childACompletion.promise;
+			throw new Error("Child headless continuation failed");
+		});
 
 		const quiescence = root.waitForRlmQuiescence();
 		await vi.waitFor(() => {
-			expect((childA as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1);
-			expect((childB as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(1);
+			expect((root as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(3);
 		});
-		childA.requestAbort();
-		await expect(quiescence).rejects.toThrow("RLM quiescence wait cancelled");
+		childACompletion.resolve();
+		await expect(quiescence).rejects.toThrow("Child headless continuation failed");
 		await vi.waitFor(() =>
 			expect((childB as unknown as InspectableRlmSession)._rlmQuiescenceWaitAborts.size).toBe(0),
 		);

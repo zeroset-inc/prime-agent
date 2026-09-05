@@ -1,0 +1,1 @@
+- Fixed child task retirement cancelling a supervising session's completion barrier; parent waits now retain ownership through child replacement and cleanup.
