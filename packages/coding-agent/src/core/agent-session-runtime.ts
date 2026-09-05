@@ -76,6 +76,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
 	private disposePromise?: Promise<void>;
+	private disposing = false;
+	private detachTaskAttempt?: () => void;
 
 	constructor(
 		private _session: AgentSession,
@@ -170,6 +172,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		reason: "new" | "resume",
 		targetSessionFile?: string,
 	): Promise<{ cancelled: boolean }> {
+		this.assertNotDisposing();
 		const runner = this.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_switch")) {
 			return { cancelled: false };
@@ -187,6 +190,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		entryId: string,
 		options: { position: "before" | "at" },
 	): Promise<{ cancelled: boolean }> {
+		this.assertNotDisposing();
 		const runner = this.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_fork")) {
 			return { cancelled: false };
@@ -214,6 +218,21 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	private bindRuntimeHost(): void {
 		this._session.setSubagentRuntimeHost(this.subagentRuntimeHost ?? this);
+		this.detachTaskAttempt?.();
+		this.detachTaskAttempt = undefined;
+		const session = this._session;
+		if (!session.taskGraph || !session.taskId || !session.taskActorId || this._metadata.kind !== "subagent") return;
+		const task = session.taskGraph.getTask(session.taskId);
+		if (["completed", "cancelled", "interrupted"].includes(task.status)) return;
+		const signal = session.taskGraph.getAttemptSignal(session.taskId, session.taskActorId);
+		const retire = () => {
+			session.requestAbort();
+			void this.dispose().catch((error: unknown) => {
+				this._diagnostics.push({ type: "warning", message: `Task attempt retirement failed: ${String(error)}` });
+			});
+		};
+		signal.addEventListener("abort", retire, { once: true });
+		this.detachTaskAttempt = () => signal.removeEventListener("abort", retire);
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -257,13 +276,22 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	): Promise<void> {
 		let result: CreateAgentSessionRuntimeResult;
 		try {
+			this.assertNotDisposing();
 			result = await build();
+			if (this.disposing) {
+				await result.session.disposeAsync();
+				this.assertNotDisposing();
+			}
 		} catch (error) {
 			this.releaseUncommittedLease(lease);
 			throw error;
 		}
 		this.apply(result);
 		this.commitReplacementLease(lease);
+	}
+
+	private assertNotDisposing(): void {
+		if (this.disposing) throw new Error("Cannot start session work after runtime disposal started");
 	}
 
 	private async teardownForReplacement(
@@ -317,6 +345,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
+		this.assertNotDisposing();
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		if (options.parentSession.sessionFile) {
 			sessionManager.newSession({
@@ -368,19 +397,34 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				},
 			}),
 		);
-		this.subagentRuntimes.set(options.id, runtime);
+		const assertStartupActive = () => {
+			this.assertNotDisposing();
+			runtime.assertNotDisposing();
+			const { taskGraph, taskId, taskActorId } = runtime.session;
+			if (taskGraph && taskId && taskActorId) taskGraph.getAttemptSignal(taskId, taskActorId);
+		};
 		try {
+			assertStartupActive();
+			this.subagentRuntimes.set(options.id, runtime);
 			await runtime.session.bindExtensions({});
+			assertStartupActive();
 			if (options.parentSession.getRlmChildRunStatus(options.id) === "cancelled") {
 				throw new Error("RLM subagent startup was cancelled");
 			}
 			if (runtime.session.sessionName !== options.sessionName) {
 				runtime.session.setSessionName(options.sessionName);
+				assertStartupActive();
 			}
 			options.onSessionPublished?.(runtime.session);
 		} catch (error) {
 			this.subagentRuntimes.delete(options.id);
-			await runtime.dispose();
+			try {
+				await runtime.dispose();
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], "Subagent startup failed and cleanup failed", {
+					cause: error,
+				});
+			}
 			throw error;
 		}
 		return runtime;
@@ -655,6 +699,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		this.assertNotDisposing();
 		const resolvedPath = resolve(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
@@ -708,9 +753,12 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	private async disposeOnce(options: AgentSessionRuntimeDisposeOptions): Promise<void> {
+		const session = this.session;
+		this.detachTaskAttempt?.();
+		this.detachTaskAttempt = undefined;
 		let disposeError: unknown;
 		try {
-			await emitSessionShutdownEvent(this.session.extensionRunner, {
+			await emitSessionShutdownEvent(session.extensionRunner, {
 				type: "session_shutdown",
 				reason: "quit",
 			});
@@ -724,7 +772,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 		try {
 			// Await the kernel's final snapshot flush before tearing the session down.
-			await this.session.disposeAsync({ kernelSnapshot: options.kernelSnapshot ?? true });
+			await session.disposeAsync({ kernelSnapshot: options.kernelSnapshot ?? true });
 		} catch (error) {
 			disposeError ??= error;
 		}
@@ -743,6 +791,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async dispose(options?: AgentSessionRuntimeDisposeOptions): Promise<void> {
+		this.disposing = true;
 		if (!this.disposePromise) {
 			this.disposePromise = this.disposeOnce(options ?? {});
 		}
@@ -766,9 +815,10 @@ export async function createAgentSessionRuntime(
 	const { sessionLease, ...runtimeOptions } = options;
 	const lease =
 		sessionLease ?? acquireSessionLease(runtimeOptions.sessionManager.getSessionFile(), runtimeOptions.agentDir);
+	let result: CreateAgentSessionRuntimeResult | undefined;
 	try {
 		assertSessionCwdExists(runtimeOptions.sessionManager, runtimeOptions.cwd);
-		const result = await createRuntime(runtimeOptions);
+		result = await createRuntime(runtimeOptions);
 		return new AgentSessionRuntime(
 			result.session,
 			result.services,
@@ -780,7 +830,13 @@ export async function createAgentSessionRuntime(
 			lease,
 		);
 	} catch (error) {
-		lease?.release();
+		try {
+			await result?.session.disposeAsync();
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "Runtime startup failed and cleanup failed", { cause: error });
+		} finally {
+			lease?.release();
+		}
 		throw error;
 	}
 }

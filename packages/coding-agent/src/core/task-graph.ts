@@ -24,6 +24,7 @@ export const AGENT_TASK_GRAPH_POLICY_CAPABILITIES = Object.freeze({
 	sharedTaskEvidence: true,
 	historicalDelegationCoverage: true,
 	sharedTaskBudget: true,
+	adjudicatedTaskCompletion: true,
 } as const);
 
 export type AgentTaskStatus =
@@ -187,6 +188,13 @@ export interface AgentTaskGap {
 	neededInformation?: string;
 	status: "open" | "resolved" | "declined";
 	reportedByAgentId: string;
+	/** Declining remediation accepts a limitation; it does not claim verification ran. */
+	adjudication?: {
+		byAgentId: string;
+		disposition: "resolved" | "accepted_limitation";
+		taskAction?: "completed_saved_result" | "resume_owner" | "await_remaining_gaps";
+		validationError?: string;
+	};
 	resolution?: string;
 	evidenceRefs: string[];
 	createdAt: string;
@@ -257,6 +265,12 @@ export interface AgentTask {
 	progress?: AgentTaskProgress;
 	convergence?: AgentTaskConvergenceState;
 	result?: AgentTaskResult;
+	pendingCompletion?: {
+		attemptId: string;
+		result: AgentTaskResult;
+		gapIds: string[];
+		submittedAt: string;
+	};
 	gaps: AgentTaskGap[];
 	resumeRequest?: AgentTaskResumeRequest;
 	usage: AgentTaskUsage;
@@ -363,6 +377,9 @@ export interface AgentTaskGraphPolicy {
 	maxTotalTokens?: number;
 	validateDelegation?: (request: AgentTaskDelegationValidationRequest) => void;
 	validateCompletion?: (request: AgentTaskCompletionValidationRequest) => void;
+	/** Save host-valid results while gaps await adjudication. Declined remediation
+	 * may complete the saved result; resolved gaps resume the owner for analysis. */
+	adjudicatedTaskCompletion?: boolean;
 	/** Optional host policy for long-running delegated tasks. Prime observes
 	 * durable evidence progress rather than imposing a task token budget. */
 	delegatedTaskConvergence?: {
@@ -433,6 +450,7 @@ export class AgentTaskGraph {
 	private degradedError?: Error;
 	private fatalError?: Error;
 	private readonly changeWaiters = new Set<() => void>();
+	private readonly attemptControllers = new Map<string, AbortController>();
 
 	private constructor(options: OpenAgentTaskGraphOptions, policy: AgentTaskGraphPolicy) {
 		this.policy = policy;
@@ -493,6 +511,19 @@ export class AgentTaskGraph {
 	getTask(taskId: string): AgentTask {
 		const task = this.findTask(taskId);
 		return clone(task);
+	}
+
+	getAttemptSignal(taskId: string, callerAgentId: string): AbortSignal {
+		const task = this.findTask(taskId);
+		this.assertOwner(task, callerAgentId);
+		this.assertActive(task, "attach to");
+		const attempt = requireCurrentAttempt(task);
+		let controller = this.attemptControllers.get(attempt.id);
+		if (!controller) {
+			controller = new AbortController();
+			this.attemptControllers.set(attempt.id, controller);
+		}
+		return controller.signal;
 	}
 
 	getCurrentTask(taskId: string, callerAgentId: string): AgentTask {
@@ -604,7 +635,18 @@ export class AgentTaskGraph {
 			}
 			if (
 				task.status === "completed" &&
-				((task.result?.unresolvedQuestions.length ?? 0) > 0 || (task.result?.coverageGaps.length ?? 0) > 0)
+				((task.result?.unresolvedQuestions.length ?? 0) > 0 ||
+					(task.result?.coverageGaps ?? []).some((reference) => {
+						if (
+							!reference ||
+							typeof reference !== "object" ||
+							Array.isArray(reference) ||
+							Object.keys(reference).length !== 1 ||
+							!("gapId" in reference)
+						)
+							return true;
+						return !task.gaps.some((gap) => gap.id === reference.gapId && gap.status !== "open");
+					}))
 			) {
 				alerts.push({
 					taskId: task.id,
@@ -1114,7 +1156,7 @@ export class AgentTaskGraph {
 			createdAt: now,
 			updatedAt: now,
 		};
-		const next = touchTask({ ...task, status: "blocked", gaps: [...task.gaps, gap] });
+		const next = touchTask({ ...task, status: "blocked", pendingCompletion: undefined, gaps: [...task.gaps, gap] });
 		const supervisor = this.findAvailableSupervisor(task);
 		const nextSupervisor = supervisor ? this.requestSupervision(supervisor, now) : undefined;
 		this.commit("task.gap_reported", callerAgentId, nextSupervisor ? [next, nextSupervisor] : [next]);
@@ -1132,11 +1174,28 @@ export class AgentTaskGraph {
 		const index = task.gaps.findIndex((gap) => gap.id === gapId);
 		if (index < 0) throw new AgentTaskGraphError(`unknown gap ${gapId} for task ${taskId}`);
 		const gap = task.gaps[index]!;
-		if (gap.status !== "open") throw new AgentTaskGraphError(`gap ${gapId} is already ${gap.status}`);
+		if (input.status !== "resolved" && input.status !== "declined") {
+			throw new AgentTaskGraphError("gap resolution status must be resolved or declined");
+		}
+		if (gap.status !== "open") {
+			if (
+				gap.status === input.status &&
+				gap.resolution === input.resolution.trim() &&
+				gap.adjudication?.byAgentId === callerAgentId &&
+				JSON.stringify(gap.evidenceRefs) === JSON.stringify(input.evidenceRefs ?? gap.evidenceRefs)
+			)
+				return clone(gap);
+			throw new AgentTaskGraphError(`gap ${gapId} is already ${gap.status}`);
+		}
+		this.assertActive(task, "resolve a gap for");
 		const nextGap: AgentTaskGap = {
 			...gap,
 			status: input.status,
 			resolution: normalizeText(input.resolution, "gap.resolution"),
+			adjudication: {
+				byAgentId: callerAgentId,
+				disposition: input.status === "declined" ? "accepted_limitation" : "resolved",
+			},
 			evidenceRefs: normalizeStringList(input.evidenceRefs ?? gap.evidenceRefs, "gap.evidenceRefs"),
 			updatedAt: new Date().toISOString(),
 		};
@@ -1145,7 +1204,7 @@ export class AgentTaskGraph {
 		const becomesRunnable = task.status === "blocked" && gaps.every((candidate) => candidate.status !== "open");
 		const requestedAt = new Date().toISOString();
 		const cycleStart = task.resumeRequest?.gapCount ?? 0;
-		const next = touchTask({
+		let next = touchTask({
 			...task,
 			status: becomesRunnable ? "pending" : task.status,
 			gaps,
@@ -1164,6 +1223,50 @@ export class AgentTaskGraph {
 					}
 				: {}),
 		});
+		const pending = task.pendingCompletion;
+		if (becomesRunnable && pending) {
+			next.pendingCompletion = undefined;
+			if (
+				this.policy.adjudicatedTaskCompletion &&
+				pending.attemptId === requireCurrentAttempt(task).id &&
+				pending.gapIds.every((id) =>
+					gaps.some(
+						(candidate) => candidate.id === id && candidate.adjudication?.disposition === "accepted_limitation",
+					),
+				) &&
+				!this.hasActiveDescendants(task.id)
+			) {
+				try {
+					this.policy.validateCompletion?.({
+						task: clone(next),
+						result: clone(pending.result),
+						snapshot: clone({
+							...this.state,
+							tasks: this.state.tasks.map((candidate) => (candidate.id === next.id ? next : candidate)),
+						}),
+					});
+					const handoff = handoffFromResult(next, pending.result);
+					next = {
+						...next,
+						status: "completed",
+						result: pending.result,
+						resumeRequest: undefined,
+						attempts: finishCurrentAttempt(next, next.ownerAgentId, "completed", handoff),
+					};
+				} catch (error) {
+					nextGap.adjudication!.validationError = boundedRuntimeText(
+						asError(error).message,
+						"Saved result needs correction",
+					);
+				}
+			}
+		}
+		nextGap.adjudication!.taskAction =
+			next.status === "completed"
+				? "completed_saved_result"
+				: becomesRunnable
+					? "resume_owner"
+					: "await_remaining_gaps";
 		this.commit("task.gap_resolved", callerAgentId, [next]);
 		return clone(nextGap);
 	}
@@ -1171,6 +1274,8 @@ export class AgentTaskGraph {
 	completeTask(taskId: string, callerAgentId: string, rawResult: AgentTaskResult): AgentTask {
 		const task = this.findTask(taskId);
 		this.assertOwner(task, callerAgentId);
+		if (task.status === "completed" && JSON.stringify(task.result) === JSON.stringify(normalizeTaskResult(rawResult)))
+			return clone(task);
 		this.assertActive(task, "complete");
 		const activeChildren = this.childrenOf(task.id).filter((child) => ACTIVE_TASK_STATUSES.has(child.status));
 		if (activeChildren.length > 0) {
@@ -1179,7 +1284,8 @@ export class AgentTaskGraph {
 			);
 		}
 		const result = normalizeTaskResult(rawResult);
-		if (task.gaps.some((gap) => gap.status === "open")) {
+		const openGaps = task.gaps.filter((gap) => gap.status === "open");
+		if (openGaps.length > 0 && !this.policy.adjudicatedTaskCompletion) {
 			throw new AgentTaskGraphError(`task ${taskId} still has open gaps`);
 		}
 		try {
@@ -1196,11 +1302,44 @@ export class AgentTaskGraph {
 			this.commit("task.handoff_recorded", callerAgentId, [next]);
 			throw error;
 		}
+		if (openGaps.length > 0) {
+			const next = touchTask({
+				...task,
+				status: "blocked",
+				pendingCompletion: {
+					attemptId: requireCurrentAttempt(task).id,
+					result,
+					gapIds: openGaps.map((gap) => gap.id),
+					submittedAt: new Date().toISOString(),
+				},
+				attempts: updateCurrentAttempt(task, callerAgentId, (attempt) => ({
+					...attempt,
+					handoff: normalizeTaskHandoff(
+						{
+							...fallbackHandoff(task, result.summary),
+							summary: result.summary,
+							candidateFindings: result.candidateFindings,
+							verification: result.verification,
+							evidenceIds: mergeStrings(task.progress?.evidenceRefs ?? [], result.evidenceRefs),
+							unresolvedQuestions: mergeStrings(
+								result.unresolvedQuestions,
+								openGaps.map((gap) => gap.description),
+							),
+						},
+						task,
+					),
+				})),
+			});
+			this.commit("task.completion_proposed", callerAgentId, [next]);
+			return clone(next);
+		}
 		const handoff = handoffFromResult(task, result);
 		const next = touchTask({
 			...task,
 			status: "completed",
 			result,
+			pendingCompletion: undefined,
+			resumeRequest: undefined,
 			attempts: finishCurrentAttempt(task, callerAgentId, "completed", handoff),
 		});
 		this.commit("task.completed", callerAgentId, [next]);
@@ -1357,6 +1496,7 @@ export class AgentTaskGraph {
 			...task,
 			ownerAgentId,
 			childAgentId: ownerAgentId,
+			pendingCompletion: undefined,
 			status: task.status,
 			attempts: [
 				...finishCurrentAttempt(task, task.ownerAgentId, "replaced", durableHandoff),
@@ -1568,7 +1708,11 @@ export class AgentTaskGraph {
 		}
 		const preservedTaskIds = new Set<string>();
 		for (const task of this.state.tasks) {
-			if (task.status !== "pending" || task.resumeRequest?.status !== "pending") continue;
+			if (
+				!(task.status === "pending" && task.resumeRequest?.status === "pending") &&
+				!(task.status === "blocked" && task.pendingCompletion?.attemptId === currentAttempt(task)?.id)
+			)
+				continue;
 			let current: AgentTask | undefined = task;
 			while (current) {
 				preservedTaskIds.add(current.id);
@@ -1694,6 +1838,16 @@ export class AgentTaskGraph {
 		};
 		this.appendEvent(event);
 		this.state = next;
+		for (const task of changedTasks) {
+			for (const attempt of task.attempts) {
+				if (attempt.status === "completed") this.attemptControllers.delete(attempt.id);
+				if (attempt.status !== "replaced" && attempt.status !== "cancelled" && attempt.status !== "interrupted")
+					continue;
+				const controller = this.attemptControllers.get(attempt.id);
+				this.attemptControllers.delete(attempt.id);
+				controller?.abort(new AgentTaskGraphError(`task attempt ${attempt.id} is ${attempt.status}`));
+			}
+		}
 		this.compactSnapshot(false);
 		this.notifyChangeWaiters();
 	}
@@ -1799,6 +1953,7 @@ export class AgentTaskGraph {
 			return touchTask({
 				...candidate,
 				status,
+				pendingCompletion: undefined,
 				result: {
 					summary: boundedRuntimeText(reason, "Task cancelled without a reason."),
 					verification: [],
@@ -2108,6 +2263,7 @@ function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined)
 		"maxTotalTokens",
 		"validateDelegation",
 		"validateCompletion",
+		"adjudicatedTaskCompletion",
 		"delegatedTaskConvergence",
 		"delegatedTaskCompletionCorrection",
 		"executionProfile",
@@ -2115,7 +2271,11 @@ function normalizeAgentTaskGraphPolicy(policy: AgentTaskGraphPolicy | undefined)
 	if (policy.requireExclusiveClaims !== undefined && typeof policy.requireExclusiveClaims !== "boolean") {
 		throw new AgentTaskGraphError("requireExclusiveClaims must be a boolean");
 	}
-	for (const field of ["requireDelegatedTaskPlan", "requireDelegationContractKey"] as const) {
+	for (const field of [
+		"requireDelegatedTaskPlan",
+		"requireDelegationContractKey",
+		"adjudicatedTaskCompletion",
+	] as const) {
 		if (policy[field] !== undefined && typeof policy[field] !== "boolean") {
 			throw new AgentTaskGraphError(`${field} must be a boolean`);
 		}
@@ -2263,6 +2423,16 @@ function normalizeUsageAttributions(task: AgentTask): AgentTask {
 		...(task.repeatReason ? { repeatReason: normalizeRepeatReason(task.repeatReason) } : {}),
 		evidence,
 		attempts,
+		...(task.pendingCompletion
+			? {
+					pendingCompletion: {
+						attemptId: normalizeIdentifier(task.pendingCompletion.attemptId, "pending completion attemptId"),
+						result: normalizeTaskResult(task.pendingCompletion.result),
+						gapIds: normalizeStringList(task.pendingCompletion.gapIds, "pending completion gapIds"),
+						submittedAt: normalizeTimestamp(task.pendingCompletion.submittedAt, "pending completion submittedAt"),
+					},
+				}
+			: {}),
 		...(task.plan ? { plan: normalizeStoredPlan(task.plan) } : {}),
 		...(task.convergence ? { convergence: normalizeConvergenceState(task.convergence) } : {}),
 		usageAttributions: Array.isArray(task.usageAttributions)

@@ -1140,6 +1140,7 @@ describe("AgentTaskGraph", () => {
 			sharedTaskEvidence: true,
 			historicalDelegationCoverage: true,
 			sharedTaskBudget: true,
+			adjudicatedTaskCompletion: true,
 		});
 	});
 
