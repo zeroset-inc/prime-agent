@@ -5,6 +5,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.js";
 import { AgentSessionRuntime, type CreateAgentSessionRuntimeResult } from "../src/core/agent-session-runtime.js";
 import type { AgentSessionServices } from "../src/core/agent-session-services.js";
+import type { CreateRlmSubagentRuntimeOptions } from "../src/core/rlm-runtime.js";
 import { acquireSessionLease, SESSION_LEASES_ENABLED_ENV } from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { AgentTaskGraph } from "../src/core/task-graph.js";
@@ -22,6 +23,114 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	});
 	return { promise, resolve };
 }
+
+it.each([
+	{ stage: "factory", retirement: "task", cleanupFails: false },
+	{ stage: "factory", retirement: "host", cleanupFails: false },
+	{ stage: "binding", retirement: "task", cleanupFails: false },
+	{ stage: "binding", retirement: "host", cleanupFails: false },
+	{ stage: "factory", retirement: "task", cleanupFails: true },
+])(
+	"cleans up $stage startup after $retirement retirement (cleanupFails=$cleanupFails)",
+	async ({ stage, retirement, cleanupFails }) => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-attempt-startup-"));
+		directories.push(directory);
+		vi.stubEnv(SESSION_LEASES_ENABLED_ENV, "1");
+		const graph = AgentTaskGraph.open({ directory, root: { ownerAgentId: "root", objective: "Review" } });
+		const task = graph.reserveDelegation({
+			parentTaskId: graph.rootTaskId,
+			callerAgentId: "root",
+			childAgentId: "child",
+			task: { objective: "Review", scope: "command", questions: ["Safe?"], delegationReason: "Narrow" },
+		});
+		const startupPaused = deferred();
+		const startupContinues = deferred();
+		const cleanupError = new Error("Session cleanup failed");
+		const childDispose = vi.fn(async () => {
+			if (cleanupFails) throw cleanupError;
+		});
+		const bindExtensions = vi.fn(async () => {
+			if (stage === "binding") {
+				startupPaused.resolve();
+				await startupContinues.promise;
+			}
+		});
+		const child = {
+			taskGraph: graph,
+			taskId: task.id,
+			taskActorId: "child",
+			sessionName: "child",
+			requestAbort: vi.fn(),
+			disposeAsync: childDispose,
+			bindExtensions,
+			setSubagentRuntimeHost: () => {},
+			extensionRunner: { hasHandlers: () => false },
+		} as unknown as AgentSession;
+		const parent = {
+			taskGraph: graph,
+			sessionManager: SessionManager.inMemory(directory, directory),
+			setSubagentRuntimeHost: () => {},
+			disposeAsync: async () => {},
+			extensionRunner: { hasHandlers: () => false },
+			getRlmChildRunStatus: () => "queued",
+		} as unknown as AgentSession;
+		const services = { cwd: directory, agentDir: directory } as AgentSessionServices;
+		let childPath: string | undefined;
+		const createRuntime = vi.fn(async (options: { sessionManager: SessionManager }) => {
+			childPath = options.sessionManager.getSessionFile();
+			if (stage === "factory") {
+				startupPaused.resolve();
+				await startupContinues.promise;
+			}
+			return { session: child, services, diagnostics: [] } as unknown as CreateAgentSessionRuntimeResult;
+		});
+		const runtime = new AgentSessionRuntime(parent, services, createRuntime);
+		const published = vi.fn();
+		const options = {
+			parentSession: parent,
+			id: "child",
+			taskId: task.id,
+			taskActorId: "child",
+			sessionName: "child",
+			sessionDir: directory,
+			onSessionPublished: published,
+		} as unknown as CreateRlmSubagentRuntimeOptions;
+		const startupResult = runtime.createRlmSubagentRuntime(options).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		await startupPaused.promise;
+		if (retirement === "task") graph.reassignTask(task.id, "root", "successor");
+		else await runtime.dispose();
+		startupContinues.resolve();
+		const error = await startupResult;
+		if (cleanupFails) {
+			expect(error).toBeInstanceOf(AggregateError);
+			expect(error).toMatchObject({
+				errors: [expect.objectContaining({ message: expect.stringContaining("does not own") }), cleanupError],
+				cause: expect.objectContaining({ message: expect.stringContaining("does not own") }),
+			});
+		} else {
+			expect(error).toBeInstanceOf(Error);
+			expect(error).toMatchObject({
+				message: expect.stringContaining(
+					stage === "factory" && retirement === "task" ? "does not own" : "runtime disposal started",
+				),
+			});
+		}
+		expect(childDispose).toHaveBeenCalledTimes(1);
+		expect(published).not.toHaveBeenCalled();
+		expect(runtime.listSubagentRuntimes()).toEqual([]);
+		if (stage === "factory") expect(bindExtensions).not.toHaveBeenCalled();
+		expect(childPath).toBeDefined();
+		const lease = acquireSessionLease(childPath, directory);
+		expect(lease).toBeDefined();
+		lease?.release();
+		await runtime.dispose();
+		await expect(runtime.createRlmSubagentRuntime(options)).rejects.toThrow("runtime disposal started");
+		expect(createRuntime).toHaveBeenCalledTimes(1);
+	},
+);
 
 it("fences a replacement built while the task attempt is retiring and releases its lease", async () => {
 	const directory = mkdtempSync(join(tmpdir(), "prime-attempt-replacement-"));

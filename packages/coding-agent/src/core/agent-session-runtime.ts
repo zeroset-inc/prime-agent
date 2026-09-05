@@ -291,7 +291,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	private assertNotDisposing(): void {
-		if (this.disposing) throw new Error("Cannot replace session after runtime disposal started");
+		if (this.disposing) throw new Error("Cannot start session work after runtime disposal started");
 	}
 
 	private async teardownForReplacement(
@@ -345,6 +345,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
+		this.assertNotDisposing();
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		if (options.parentSession.sessionFile) {
 			sessionManager.newSession({
@@ -396,9 +397,13 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				},
 			}),
 		);
-		this.subagentRuntimes.set(options.id, runtime);
 		try {
+			this.assertNotDisposing();
+			runtime.assertNotDisposing();
+			this.subagentRuntimes.set(options.id, runtime);
 			await runtime.session.bindExtensions({});
+			this.assertNotDisposing();
+			runtime.assertNotDisposing();
 			if (options.parentSession.getRlmChildRunStatus(options.id) === "cancelled") {
 				throw new Error("RLM subagent startup was cancelled");
 			}
@@ -408,7 +413,13 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			options.onSessionPublished?.(runtime.session);
 		} catch (error) {
 			this.subagentRuntimes.delete(options.id);
-			await runtime.dispose();
+			try {
+				await runtime.dispose();
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], "Subagent startup failed and cleanup failed", {
+					cause: error,
+				});
+			}
 			throw error;
 		}
 		return runtime;
@@ -799,9 +810,10 @@ export async function createAgentSessionRuntime(
 	const { sessionLease, ...runtimeOptions } = options;
 	const lease =
 		sessionLease ?? acquireSessionLease(runtimeOptions.sessionManager.getSessionFile(), runtimeOptions.agentDir);
+	let result: CreateAgentSessionRuntimeResult | undefined;
 	try {
 		assertSessionCwdExists(runtimeOptions.sessionManager, runtimeOptions.cwd);
-		const result = await createRuntime(runtimeOptions);
+		result = await createRuntime(runtimeOptions);
 		return new AgentSessionRuntime(
 			result.session,
 			result.services,
@@ -813,7 +825,13 @@ export async function createAgentSessionRuntime(
 			lease,
 		);
 	} catch (error) {
-		lease?.release();
+		try {
+			await result?.session.disposeAsync();
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "Runtime startup failed and cleanup failed", { cause: error });
+		} finally {
+			lease?.release();
+		}
 		throw error;
 	}
 }
