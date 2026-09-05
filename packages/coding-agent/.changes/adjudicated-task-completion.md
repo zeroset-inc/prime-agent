@@ -1,0 +1,2 @@
+- Fixed repeated child completion turns after a supervisor accepts a verification limitation, preserving the submitted result and the supervisor's decision.
+- Fixed superseded task attempts continuing to run after ownership is reassigned.

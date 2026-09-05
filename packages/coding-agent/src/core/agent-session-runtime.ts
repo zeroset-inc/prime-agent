@@ -76,6 +76,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
 	private disposePromise?: Promise<void>;
+	private detachTaskAttempt?: () => void;
 
 	constructor(
 		private _session: AgentSession,
@@ -214,6 +215,21 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	private bindRuntimeHost(): void {
 		this._session.setSubagentRuntimeHost(this.subagentRuntimeHost ?? this);
+		this.detachTaskAttempt?.();
+		this.detachTaskAttempt = undefined;
+		const session = this._session;
+		if (!session.taskGraph || !session.taskId || !session.taskActorId || this._metadata.kind !== "subagent") return;
+		const task = session.taskGraph.getTask(session.taskId);
+		if (["completed", "cancelled", "interrupted"].includes(task.status)) return;
+		const signal = session.taskGraph.getAttemptSignal(session.taskId, session.taskActorId);
+		const retire = () => {
+			session.requestAbort();
+			void this.dispose().catch((error: unknown) => {
+				this._diagnostics.push({ type: "warning", message: `Task attempt retirement failed: ${String(error)}` });
+			});
+		};
+		signal.addEventListener("abort", retire, { once: true });
+		this.detachTaskAttempt = () => signal.removeEventListener("abort", retire);
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -708,6 +724,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	private async disposeOnce(options: AgentSessionRuntimeDisposeOptions): Promise<void> {
+		this.detachTaskAttempt?.();
+		this.detachTaskAttempt = undefined;
 		let disposeError: unknown;
 		try {
 			await emitSessionShutdownEvent(this.session.extensionRunner, {
