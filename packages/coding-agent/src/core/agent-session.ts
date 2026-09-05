@@ -10969,11 +10969,17 @@ export class AgentSession {
 	 * each drain includes descendants spawned while earlier results were consumed.
 	 */
 	async waitForRlmQuiescence(externalSignal?: AbortSignal): Promise<void> {
+		return this._waitForRlmQuiescence(externalSignal, this);
+	}
+
+	private async _waitForRlmQuiescence(externalSignal: AbortSignal | undefined, owner: AgentSession): Promise<void> {
 		const cancellation = new AbortController();
 		const cancelFromParent = () => cancellation.abort();
 		if (externalSignal?.aborted) cancellation.abort();
 		else externalSignal?.addEventListener("abort", cancelFromParent, { once: true });
-		this._rlmQuiescenceWaitAborts.add(cancellation);
+		// Descendant waits belong to the initiating session. Retiring one child
+		// must not cancel its parent's barrier or the sibling waits it owns.
+		owner._rlmQuiescenceWaitAborts.add(cancellation);
 		let rejectCancelled = (_error: Error) => {};
 		const cancelled = new Promise<never>((_resolve, reject) => {
 			rejectCancelled = reject;
@@ -10985,6 +10991,7 @@ export class AgentSession {
 		try {
 			while (true) {
 				await wait(this.waitForHeadlessIdle());
+				if (this._disposeAsyncPromise) await wait(this._disposeAsyncPromise);
 				// Strong RLM quiescence also owns work that interactive waitForIdle ignores.
 				if (this.isSessionActive || this._hasDeferredRlmTerminalNotices()) {
 					await wait(this._waitForSessionActivityChange(cancellation.signal));
@@ -10996,7 +11003,7 @@ export class AgentSession {
 				await wait(
 					Promise.all([
 						...unsettledRuns.map((run) => run.settlement.promise),
-						...childSessions.map((child) => child.waitForRlmQuiescence(cancellation.signal)),
+						...childSessions.map((child) => child._waitForRlmQuiescence(cancellation.signal, owner)),
 					]),
 				);
 				// Always loop through the self-active/deferred checks again. Work may
@@ -11008,7 +11015,7 @@ export class AgentSession {
 			cancellation.abort();
 			externalSignal?.removeEventListener("abort", cancelFromParent);
 			cancellation.signal.removeEventListener("abort", onCancelled);
-			this._rlmQuiescenceWaitAborts.delete(cancellation);
+			owner._rlmQuiescenceWaitAborts.delete(cancellation);
 		}
 	}
 
