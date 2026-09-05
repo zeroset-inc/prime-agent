@@ -397,18 +397,23 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				},
 			}),
 		);
-		try {
+		const assertStartupActive = () => {
 			this.assertNotDisposing();
 			runtime.assertNotDisposing();
+			const { taskGraph, taskId, taskActorId } = runtime.session;
+			if (taskGraph && taskId && taskActorId) taskGraph.getAttemptSignal(taskId, taskActorId);
+		};
+		try {
+			assertStartupActive();
 			this.subagentRuntimes.set(options.id, runtime);
 			await runtime.session.bindExtensions({});
-			this.assertNotDisposing();
-			runtime.assertNotDisposing();
+			assertStartupActive();
 			if (options.parentSession.getRlmChildRunStatus(options.id) === "cancelled") {
 				throw new Error("RLM subagent startup was cancelled");
 			}
 			if (runtime.session.sessionName !== options.sessionName) {
 				runtime.session.setSessionName(options.sessionName);
+				assertStartupActive();
 			}
 			options.onSessionPublished?.(runtime.session);
 		} catch (error) {

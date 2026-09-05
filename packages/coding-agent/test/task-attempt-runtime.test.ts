@@ -24,12 +24,51 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
+it("preserves completed-session hydration without requiring an active task", async () => {
+	const getAttemptSignal = vi.fn(() => {
+		throw new Error("Completed tasks have no active attempt");
+	});
+	const requestAbort = vi.fn();
+	const disposeAsync = vi.fn(async () => {});
+	const session = {
+		taskGraph: { getTask: () => ({ status: "completed" }), getAttemptSignal },
+		taskId: "completed-task",
+		taskActorId: "child",
+		requestAbort,
+		disposeAsync,
+		setSubagentRuntimeHost: () => {},
+		extensionRunner: { hasHandlers: () => false },
+	} as unknown as AgentSession;
+	const runtime = new AgentSessionRuntime(
+		session,
+		{} as AgentSessionServices,
+		() => {
+			throw new Error("Not used for hydration");
+		},
+		[],
+		undefined,
+		undefined,
+		{ kind: "subagent", createdAt: 1, taskId: "completed-task", rehydratedCompleted: true },
+	);
+	expect(runtime.session).toBe(session);
+	expect(getAttemptSignal).not.toHaveBeenCalled();
+	expect(requestAbort).not.toHaveBeenCalled();
+	await runtime.dispose();
+	expect(disposeAsync).toHaveBeenCalledTimes(1);
+});
+
 it.each([
 	{ stage: "factory", retirement: "task", cleanupFails: false },
 	{ stage: "factory", retirement: "host", cleanupFails: false },
 	{ stage: "binding", retirement: "task", cleanupFails: false },
 	{ stage: "binding", retirement: "host", cleanupFails: false },
 	{ stage: "factory", retirement: "task", cleanupFails: true },
+	{ stage: "factory", retirement: "cancelled", cleanupFails: false },
+	{ stage: "factory", retirement: "interrupted", cleanupFails: false },
+	{ stage: "factory", retirement: "completed", cleanupFails: false },
+	{ stage: "binding", retirement: "cancelled", cleanupFails: false },
+	{ stage: "binding", retirement: "interrupted", cleanupFails: false },
+	{ stage: "binding", retirement: "completed", cleanupFails: false },
 ])(
 	"cleans up $stage startup after $retirement retirement (cleanupFails=$cleanupFails)",
 	async ({ stage, retirement, cleanupFails }) => {
@@ -101,6 +140,17 @@ it.each([
 		);
 		await startupPaused.promise;
 		if (retirement === "task") graph.reassignTask(task.id, "root", "successor");
+		else if (retirement === "cancelled") graph.cancelTask(task.id, "root", "No longer needed");
+		else if (retirement === "interrupted") graph.interruptTask(task.id, "root", "Execution stopped");
+		else if (retirement === "completed")
+			graph.completeTask(task.id, "child", {
+				summary: "Already completed",
+				verification: [],
+				candidateFindings: [],
+				unresolvedQuestions: [],
+				coverageGaps: [],
+				evidenceRefs: [],
+			});
 		else await runtime.dispose();
 		startupContinues.resolve();
 		const error = await startupResult;
@@ -112,10 +162,15 @@ it.each([
 			});
 		} else {
 			expect(error).toBeInstanceOf(Error);
+			const terminalStatus = ["cancelled", "interrupted", "completed"].includes(retirement);
+			const expectedMessage =
+				terminalStatus && (stage === "factory" || retirement === "completed")
+					? `status ${retirement}`
+					: stage === "factory" && retirement === "task"
+						? "does not own"
+						: "runtime disposal started";
 			expect(error).toMatchObject({
-				message: expect.stringContaining(
-					stage === "factory" && retirement === "task" ? "does not own" : "runtime disposal started",
-				),
+				message: expect.stringContaining(expectedMessage),
 			});
 		}
 		expect(childDispose).toHaveBeenCalledTimes(1);
