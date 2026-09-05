@@ -76,6 +76,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
 	private disposePromise?: Promise<void>;
+	private disposing = false;
 	private detachTaskAttempt?: () => void;
 
 	constructor(
@@ -171,6 +172,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		reason: "new" | "resume",
 		targetSessionFile?: string,
 	): Promise<{ cancelled: boolean }> {
+		this.assertNotDisposing();
 		const runner = this.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_switch")) {
 			return { cancelled: false };
@@ -188,6 +190,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		entryId: string,
 		options: { position: "before" | "at" },
 	): Promise<{ cancelled: boolean }> {
+		this.assertNotDisposing();
 		const runner = this.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_fork")) {
 			return { cancelled: false };
@@ -273,13 +276,22 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	): Promise<void> {
 		let result: CreateAgentSessionRuntimeResult;
 		try {
+			this.assertNotDisposing();
 			result = await build();
+			if (this.disposing) {
+				await result.session.disposeAsync();
+				this.assertNotDisposing();
+			}
 		} catch (error) {
 			this.releaseUncommittedLease(lease);
 			throw error;
 		}
 		this.apply(result);
 		this.commitReplacementLease(lease);
+	}
+
+	private assertNotDisposing(): void {
+		if (this.disposing) throw new Error("Cannot replace session after runtime disposal started");
 	}
 
 	private async teardownForReplacement(
@@ -671,6 +683,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		this.assertNotDisposing();
 		const resolvedPath = resolve(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
@@ -724,11 +737,12 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	private async disposeOnce(options: AgentSessionRuntimeDisposeOptions): Promise<void> {
+		const session = this.session;
 		this.detachTaskAttempt?.();
 		this.detachTaskAttempt = undefined;
 		let disposeError: unknown;
 		try {
-			await emitSessionShutdownEvent(this.session.extensionRunner, {
+			await emitSessionShutdownEvent(session.extensionRunner, {
 				type: "session_shutdown",
 				reason: "quit",
 			});
@@ -742,7 +756,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 		try {
 			// Await the kernel's final snapshot flush before tearing the session down.
-			await this.session.disposeAsync({ kernelSnapshot: options.kernelSnapshot ?? true });
+			await session.disposeAsync({ kernelSnapshot: options.kernelSnapshot ?? true });
 		} catch (error) {
 			disposeError ??= error;
 		}
@@ -761,6 +775,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async dispose(options?: AgentSessionRuntimeDisposeOptions): Promise<void> {
+		this.disposing = true;
 		if (!this.disposePromise) {
 			this.disposePromise = this.disposeOnce(options ?? {});
 		}
